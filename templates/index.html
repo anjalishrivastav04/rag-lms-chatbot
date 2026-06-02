@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>RAG Chatbot</title>
+  <link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+  <div class="chat-container">
+    <div class="chat-header">
+      🤖 RAG Chatbot
+      <span class="status">● Online</span>
+    </div>
+    <div class="chat-messages" id="messages"></div>
+    <div class="chat-input">
+      <input type="text" id="userInput" placeholder="Ask something from the docs..." />
+      <button onclick="sendMessage()">Send</button>
+    </div>
+  </div>
+
+  <script>
+    function addMessage(text, sender) {
+      const box = document.getElementById("messages");
+      const div = document.createElement("div");
+      div.className = `message ${sender}-message`;
+      div.textContent = text;
+      box.appendChild(div);
+      box.scrollTop = box.scrollHeight;
+    }
+
+    async function sendMessage() {
+      const input = document.getElementById("userInput");
+      const text = input.value.trim();
+      if (!text) return;
+
+      addMessage(text, "user");
+      input.value = "";
+      addMessage("Thinking...", "bot");
+
+      const res = await fetch("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text })
+      });
+
+      const data = await res.json();
+      const messages = document.getElementById("messages");
+      messages.lastChild.textContent = data.reply;
+    }
+
+    document.getElementById("userInput").addEventListener("keydown", e => {
+      if (e.key === "Enter") sendMessage();
+    });
+
+    window.onload = () => addMessage("Hi! Ask me anything from the documents 📄", "bot");
+  </script>
+</body>
+</html>
