@@ -1,155 +1,401 @@
+import os
+import re
+import hashlib
+import glob
+import redis
+from dotenv import load_dotenv
+
+# 🚨 CRITICAL: Load environment variables BEFORE initializing any LangChain or local vision tools
+load_dotenv()
+
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
-from dotenv import load_dotenv
-import glob
-import os
+from langchain_groq import ChatGroq
+from langchain_core.documents import Document
+from ocr_handler import save_ocr_text_to_file, extract_text_from_image  
+from langchain_classic.indexes import SQLRecordManager, index
+from pdf2image import convert_from_path  
+from vision_handler import analyze_image  # 👈 Safe to import now that environment is active!
 
-# --- IMPORTS FOR AI TAGGING ---
-from google import genai
-from google.genai import types
-from openai import OpenAI
-from pydantic import BaseModel, Field
+# --- SYSTEM INTEGRATION PATHS ---
+# 🌟 Verified absolute path to your compiled OneDrive desktop binaries
+POPPLER_PATH = r"C:\Users\iaman\OneDrive\Documents\Desktop\poppler-26.02.0\Library\bin"
 
-load_dotenv()
+# --- REDIS CONFIG ---
+redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 
-# 🎛️ SWITCH PROVIDER HERE: Set to "gemini" or "grok"
-PROVIDER = "gemini" 
+# --- GROQ LLM ---
+llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, api_key=os.getenv("GROQ_API_KEY"))
 
-# --- SCHEMA FOR STRUCTURED OUTPUT ---
-class DocumentTags(BaseModel):
-    keywords: list[str] = Field(description="List of 3-5 high-quality keywords or technical terms related to the text chunk.")
+# --- EMBEDDINGS ---
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
-# --- GEMINI TAGGING FUNCTION ---
-def get_keywords_gemini(client: genai.Client, text_content: str) -> list[str]:
-    prompt = f"Analyze the following document chunk and extract the most relevant keywords or technical topics:\n\n{text_content}"
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=DocumentTags,
-                temperature=0.1
-            ),
-        )
-        return DocumentTags.model_validate_json(response.text).keywords
-    except Exception as e:
-        print(f"⚠️ Gemini Error: {e}")
-        return []
+# --- RECORD MANAGER FOR INCREMENTAL INDEXING ---
+record_manager = SQLRecordManager(
+    namespace="rag-chatbot",
+    db_url="sqlite:///record_manager_cache.db"
+)
+record_manager.create_schema()
 
-# --- GROK TAGGING FUNCTION ---
-def get_keywords_grok(client: OpenAI, text_content: str) -> list[str]:
-    prompt = f"Analyze the following document chunk and extract the most relevant keywords or technical topics:\n\n{text_content}"
-    try:
-        response = client.beta.chat.completions.parse(
-            model="grok-beta",
-            messages=[
-                {"role": "system", "content": "You are an assistant that extracts high-quality metadata keywords from technical text."},
-                {"role": "user", "content": prompt}
-            ],
-            response_format=DocumentTags,
-            temperature=0.1
-        )
-        result = response.choices[0].message.parsed
-        return result.keywords if result else []
-    except Exception as e:
-        print(f"⚠️ Grok Error: {e}")
-        return []
+# -------------------------------------------
+# STATISTICAL ANALYSIS
+# -------------------------------------------
+def statistical_analysis(content):
+    sentences = re.split(r'[.!?]+', content)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+    words = content.split()
+    paragraphs = [p.strip() for p in content.split('\n\n') if len(p.strip()) > 20]
 
-def ingest_documents():
-    docs = []
+    if not sentences:
+        return "recursive", 0.50
 
-    # Load .txt files
-    for path in glob.glob("documents/*.txt"):
-        loader = TextLoader(path, encoding="utf-8")
-        loaded = loader.load()
-        for doc in loaded:
-            doc.metadata["source"] = os.path.basename(path)
-            doc.metadata["filetype"] = "txt"
-        docs.extend(loaded)
+    avg_sentence_len = sum(len(s.split()) for s in sentences) / max(len(sentences), 1)
+    vocabulary_richness = len(set(words)) / max(len(words), 1)
+    paragraph_count = len(paragraphs)
+    has_headers = bool(re.search(r'\n#{1,3} |\n[A-Z][^\n]{0,50}\n[-=]+', content))
+    has_tables = bool(re.search(r'\|.*\|.*\|', content))
+    has_code = bool(re.search(r'```|def |class |import |function ', content))
+    has_math = bool(re.search(r'\$.*\$|equation|formula|theorem', content, re.IGNORECASE))
+    has_bullets = bool(re.search(r'\n[-*•] ', content))
+    doc_length = len(content)
 
-    # Load .pdf files
-    for path in glob.glob("documents/*.pdf"):
-        loader = PyPDFLoader(path)
-        loaded = loader.load()
-        for doc in loaded:
-            doc.metadata["source"] = os.path.basename(path)
-            doc.metadata["filetype"] = "pdf"
-        docs.extend(loaded)
+    print(f"📊 Document Stats:")
+    print(f"   Avg sentence length: {avg_sentence_len:.1f} words")
+    print(f"   Vocabulary richness: {vocabulary_richness:.2f}")
+    print(f"   Paragraphs: {paragraph_count}")
+    print(f"   Headers: {has_headers} | Tables: {has_tables} | Code: {has_code} | Math: {has_math}")
 
-    if not docs:
-        print("No documents found in /documents folder!")
-        return
+    if has_code and has_headers:
+        return "structure", 0.88
+    if has_headers and paragraph_count > 3:
+        return "recursive", 0.90
+    if has_math and avg_sentence_len > 20:
+        return "semantic", 0.72
+    if has_tables and not has_code:
+        return "structure", 0.85
+    if paragraph_count > 10 and avg_sentence_len > 15:
+        return "paragraph", 0.85
+    if avg_sentence_len < 12 and has_bullets:
+        return "sentence", 0.82
+    if doc_length > 10000 and paragraph_count < 5:
+        return "sliding", 0.80
+    return "recursive", 0.70
 
-    # 🛠️ --- ADVANCED PARENT-CHILD SPLITTING LAYER ---
-    # Parent documents capture enough layout to hold explanations together
-    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=150)
-    # Child splitter generates sharp chunks to give highly accurate semantic searches
-    child_splitter = RecursiveCharacterTextSplitter(chunk_size=250, chunk_overlap=30)
-    
-    final_child_chunks = []
-    global_chunk_counter = 0
+# -------------------------------------------
+# LLM FALLBACK
+# -------------------------------------------
+def ask_llm_for_chunking(sample_text):
+    prompt = f"""Analyze this document sample and recommend the best text chunking strategy for a RAG system.
+Choose ONLY ONE from: recursive, sentence, paragraph, sliding, structure, semantic
 
-    print("✂️ Splitting documents into parent and child structural hierarchies...")
-    for doc in docs:
-        # Step 1: Split source files into larger parent blocks
-        parent_chunks = parent_splitter.split_documents([doc])
-        
-        for p_chunk in parent_chunks:
-            # Step 2: Split those parent blocks into small searchable chunks
-            child_chunks = child_splitter.split_documents([p_chunk])
-            
-            for c_chunk in child_chunks:
-                # Step 3: Embed the parent content and source details inside the child's metadata
-                c_chunk.metadata["parent_content"] = p_chunk.page_content
-                c_chunk.metadata["source"] = doc.metadata.get("source")
-                c_chunk.metadata["filetype"] = doc.metadata.get("filetype")
-                c_chunk.metadata["chunk_index"] = global_chunk_counter
-                final_child_chunks.append(c_chunk)
-                global_chunk_counter += 1
+Document sample:
+{sample_text}
 
-    chunks = final_child_chunks
-    # -----------------------------------------------
+Reply with ONLY the strategy name in lowercase, nothing else."""
+    response = llm.invoke(prompt)
+    method = response.content.strip().lower()
+    valid = ["recursive", "sentence", "paragraph", "sliding", "structure", "semantic"]
+    return method if method in valid else "recursive"
 
-    # Initialize the selected client
-    if PROVIDER == "gemini":
-        ai_client = genai.Client()
-        print(f"\n✨ Extracting keyword tags via GEMINI for {len(chunks)} chunks...")
-    elif PROVIDER == "grok":
-        ai_client = OpenAI(api_key=os.getenv("XAI_API_KEY"), base_url="https://api.x.ai/v1")
-        print(f"\n✨ Extracting keyword tags via GROK for {len(chunks)} chunks...")
+# -------------------------------------------
+# CHUNKING METHOD DETECTOR
+# -------------------------------------------
+def detect_chunking_method(content):
+    file_hash = hashlib.md5(content.encode()).hexdigest()
+    cache_key = f"chunking:{file_hash}"
+
+    cached = redis_client.get(cache_key)
+    if cached:
+        print(f"⚡ Chunking method from Redis cache: {cached}")
+        return cached
+
+    method, confidence = statistical_analysis(content)
+    print(f"📊 Statistical result: {method} (confidence: {confidence:.0%})")
+
+    if confidence < 0.75:
+        print(f"🧠 Low confidence — asking LLM...")
+        method = ask_llm_for_chunking(content[:2000])
+        print(f"🤖 LLM recommended: {method}")
     else:
-        print("❌ Invalid PROVIDER selected! Choose 'gemini' or 'grok'.")
+        print(f"✅ High confidence — using: {method}")
+
+    redis_client.set(cache_key, method)
+    print(f"💾 Chunking decision cached in Redis.")
+    return method
+
+# -------------------------------------------
+# GET SPLITTER
+# -------------------------------------------
+def get_splitter(method):
+    print(f"✂️ Applying chunking method: {method}")
+
+    if method == "sentence":
+        return RecursiveCharacterTextSplitter(
+            chunk_size=200,
+            chunk_overlap=20,
+            separators=[". ", "! ", "? ", "\n"]
+        )
+    elif method == "paragraph":
+        return RecursiveCharacterTextSplitter(
+            chunk_size=800,
+            chunk_overlap=100,
+            separators=["\n\n", "\n", ". "]
+        )
+    elif method == "sliding":
+        return RecursiveCharacterTextSplitter(
+            chunk_size=400,
+            chunk_overlap=100,
+            separators=[" ", "\n"]
+        )
+    elif method == "structure":
+        return RecursiveCharacterTextSplitter(
+            chunk_size=600,
+            chunk_overlap=50,
+            separators=["\n## ", "\n# ", "\n### ", "\n\n", "\n"]
+        )
+    elif method == "semantic":
+        return RecursiveCharacterTextSplitter(
+            chunk_size=600,
+            chunk_overlap=150,
+            separators=["\n\n", "\n", ". ", " "]
+        )
+    else:
+        return RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=50
+        )
+
+# -------------------------------------------
+# MAIN INGEST FUNCTION
+# -------------------------------------------
+def ingest_documents():
+    all_chunks = []
+
+    file_paths = (
+        glob.glob("documents/*.txt") + 
+        glob.glob("documents/*.pdf") + 
+        glob.glob("documents/*.jpg") + 
+        glob.glob("documents/*.jpeg") + 
+        glob.glob("documents/*.png") + 
+        glob.glob("documents/*.bmp") + 
+        glob.glob("documents/*.gif")
+    )
+
+    if not file_paths:
+        print("📁 No documents found in /documents folder.")
         return
 
-    # Add AI generated keyword tags to child chunks
-    for i, chunk in enumerate(chunks):
-        # We pass child text content to keep structural summary crisp
-        if PROVIDER == "gemini":
-            ai_keywords = get_keywords_gemini(ai_client, chunk.page_content)
-        elif PROVIDER == "grok":
-            ai_keywords = get_keywords_grok(ai_client, chunk.page_content)
+    print(f"\n{'='*80}")
+    print(f"🔍 INCREMENTAL INGESTION REPORT")
+    print(f"{'='*80}")
+    print(f"📊 Total files to check: {len(file_paths)}\n")
+
+    any_processed = False
+
+    for path in file_paths:
+        filename = os.path.basename(path)
+        filename_lower = filename.lower()
+        
+        if filename_lower.endswith('_ocr.txt') or filename_lower.endswith('_vision.txt'):
+            print(f"⏭️  SKIPPED: {filename} (Temporary derivative file)\n")
+            continue
             
-        chunk.metadata["keywords"] = ai_keywords
-        print(f"  Processed chunk {i+1}/{len(chunks)} | Tags: {ai_keywords}")
+        # -------------------------------------------------------------
+        # 🧠 EARLY CACHE CHECK: Stop processing if the file is unchanged
+        # -------------------------------------------------------------
+        try:
+            with open(path, "rb") as f:
+                raw_bytes = f.read()
+            file_disk_hash = hashlib.md5(raw_bytes).hexdigest()
+            
+            is_already_indexed = redis_client.get(f"fastpass_hash:{filename}")
+            
+            if is_already_indexed == file_disk_hash:
+                print(f"⚡ FAST-PASS: {filename} has not changed. Skipping extraction and vision analysis entirely!\n")
+                continue
+        except Exception as hash_err:
+            print(f"⚠️ Pre-computation skip check warning: {hash_err}")
+        # -------------------------------------------------------------
 
-    # Print tags for verification
-    print("\n📌 Tagged Chunks Preview:")
-    for chunk in chunks[:3]:
-        print(f"  Source: {chunk.metadata['source']} | Type: {chunk.metadata['filetype']} | Chunk: {chunk.metadata['chunk_index']}")
-        print(f"  Keywords: {chunk.metadata['keywords']}")
-        print(f"  Content: {chunk.page_content[:80]}...")
-        print()
+        print(f"📄 PROCESSING: {filename}")
+        any_processed = True
+        docs = []
 
-    # Save vector store
-    print("📦 Generating embeddings and saving FAISS index...")
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    vectorstore = FAISS.from_documents(chunks, embeddings)
-    vectorstore.save_local("vectorstore")
+        try:
+            # 1. Handle Text Files
+            if filename_lower.endswith('.txt'):
+                loader = TextLoader(path, encoding="utf-8")
+                docs = loader.load()
+                
+            # 2. Handle PDF Files (Smart Hybrid with Spacing Defect Detection)
+            elif filename_lower.endswith('.pdf'):
+                print(f"🔍 Loading PDF layout layers...")
+                loader = PyPDFLoader(path)
+                raw_pdf_docs = loader.load()
+                
+                for page_num, doc in enumerate(raw_pdf_docs):
+                    text_content = doc.page_content.strip()
+                    
+                    clean_char_count = len(re.sub(r'\s+', '', text_content))
+                    
+                    is_spaced_out = False
+                    if len(text_content) > 0:
+                        single_letters = len(re.findall(r'\b[a-zA-Z]\b', text_content))
+                        total_words = max(len(text_content.split()), 1)
+                        if (single_letters / total_words) > 0.40:
+                            is_spaced_out = True
+                    
+                    if clean_char_count > 30 and not is_spaced_out:
+                        docs.append(doc)
+                    else:
+                        print(f"📸 Page {page_num + 1} flagged as image scan or broken layout. Initiating OCR fallback...")
+                        try:
+                            # 🌟 PASSED POPPLER BINARIES PATH DIRECTLY HERE:
+                            images = convert_from_path(
+                                path, 
+                                first_page=page_num + 1, 
+                                last_page=page_num + 1, 
+                                dpi=200,
+                                poppler_path=POPPLER_PATH
+                            )
+                            if images:
+                                temp_img_path = f"documents/temp_page_{page_num + 1}.jpg"
+                                images[0].save(temp_img_path, 'JPEG')
+                                
+                                ocr_text, confidence = extract_text_from_image(temp_img_path)
+                                
+                                if ocr_text and ocr_text.strip():
+                                    print(f"✨ Successfully extracted clean text from PDF Page {page_num + 1}!")
+                                    docs.append(Document(
+                                        page_content=ocr_text,
+                                        metadata={
+                                            "source": filename,
+                                            "page": page_num + 1
+                                        }
+                                    ))
+                                
+                                if os.path.exists(temp_img_path):
+                                    os.remove(temp_img_path)
+                        except Exception as pdf_img_err:
+                            print(f"⚠️ Image-to-PDF parser skipped Page {page_num + 1}: {pdf_img_err}")
+                            docs.append(doc)
 
-    print(f"✅ Ingested {len(chunks)} chunks from structural hierarchies using {PROVIDER.upper()} tags!")
+            # 3. Handle Pure Image Files with Toggle Configuration
+            elif any(filename_lower.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.gif']):
+                vision_description = "Visual descriptions disabled via system config parameters."
+                
+                if os.getenv("USE_GOOGLE_VISION", "False").lower() == "true":
+                    print(f"🖼️ Image detected - attempting analysis with local VLM engine...")
+                    try:
+                        vision_description = analyze_image(path)
+                    except Exception as vision_err:
+                        print(f"⚠️ Local VLM parsing failed. Bypassing structural description...")
+                        vision_description = "Visual workspace descriptions unavailable. Falling back to clean OCR."
+                else:
+                    print(f"⚙️ Skipping VLM engine (USE_GOOGLE_VISION=False). Running local OCR framework pipeline...")
+
+                print(f"📸 Running OCR for handwritten text...")
+                output_txt_path, ocr_error = save_ocr_text_to_file(path)
+                
+                combined_text = f"=== IMAGE ANALYSIS SUMMARY ===\n{vision_description}\n\n"
+                
+                if output_txt_path and os.path.exists(output_txt_path):
+                    with open(output_txt_path, 'r', encoding='utf-8') as f:
+                        ocr_text = f.read()
+                    combined_text += f"=== OCR EXTRACTED TEXT ===\n{ocr_text}"
+                    
+                    with open(output_txt_path, 'w', encoding='utf-8') as f:
+                        f.write(combined_text)
+                    
+                    loader = TextLoader(output_txt_path, encoding="utf-8")
+                    docs = loader.load()
+                else:
+                    temp_vision_path = f"documents/{os.path.splitext(filename)[0]}_vision.txt"
+                    with open(temp_vision_path, 'w', encoding='utf-8') as f:
+                        f.write(combined_text)
+                    loader = TextLoader(temp_vision_path, encoding="utf-8")
+                    docs = loader.load()
+
+            if not docs:
+                print(f"⚠️  No content extracted from {filename}\n")
+                continue
+
+            content = " ".join([d.page_content for d in docs])
+            if not content.strip():
+                print(f"⚠️  Empty content after processing {filename}\n")
+                continue
+                
+            method = detect_chunking_method(content)
+            splitter = get_splitter(method)
+            chunks = splitter.split_documents(docs)
+
+            for i, chunk in enumerate(chunks):
+                chunk.metadata["source"] = filename  
+                chunk.metadata["filetype"] = filename.rsplit('.', 1)[1].lower()
+                chunk.metadata["chunk_index"] = i
+                chunk.metadata["chunking_method"] = method
+
+            all_chunks.extend(chunks)
+            print(f"   ... ADDED: {len(chunks)} chunks\n")
+            
+            # Cache the successful hash state mapping inside Redis
+            redis_client.set(f"fastpass_hash:{filename}", file_disk_hash)
+            
+        except Exception as e:
+            print(f"❌ Failed processing {filename}: {str(e)}\n")
+            continue
+
+    if not any_processed:
+        print("⚡ All files verified via Fast-Pass checksum profiles. Vector space index is up to date!")
+        return
+
+    if not all_chunks:
+        print("⚠️ No new or updated text chunks gathered to index.")
+        return
+
+    # --- STABILIZED FAISS WORKSPACE INDEX HANDLING ---
+    faiss_dir = "vectorstore"
+    faiss_file = os.path.join(faiss_dir, "index.faiss")
+    
+    if os.path.exists(faiss_dir) and os.path.exists(faiss_file):
+        print("💾 Loading existing FAISS index for synchronization...")
+        vectorstore = FAISS.load_local(faiss_dir, embeddings, allow_dangerous_deserialization=True)
+    else:
+        print("✨ Building fresh vector footprint pipeline...")
+        first_chunk = all_chunks.pop(0)
+        vectorstore = FAISS.from_documents([first_chunk], embeddings)
+
+    print(f"🔀 Running parallel deduplication for {len(all_chunks)} incoming chunks...")
+    
+    try:
+        sync_stats = index(
+            all_chunks,
+            record_manager,
+            vectorstore,
+            cleanup="incremental",  
+            source_id_key="source"
+        )
+        
+        print(f"📊 Synchronization Report: {sync_stats}")
+        print(f"\n{'='*80}")
+        print(f"✅ INGESTION SUMMARY")
+        print(f"{'='*80}")
+        print(f"✅ Added: {sync_stats.get('num_added', 0)} new chunks")
+        print(f"⏭️  Skipped: {sync_stats.get('num_skipped', 0)} existing chunks")
+        print(f"🗑️  Deleted: {sync_stats.get('num_deleted', 0)} old chunks")
+        print(f"📊 Updated: {sync_stats.get('num_updated', 0)} chunks")
+        print(f"{'='*80}\n")
+        
+    except ValueError as val_err:
+        print(f"⚠️ Index Sync Desynchronization Detected: ({val_err})")
+        print("🔄 Performing automatic index reconciliation rebuild...")
+        vectorstore = FAISS.from_documents(all_chunks, embeddings)
+        print("✅ Vector database re-indexed cleanly from active documents.")
+
+    vectorstore.save_local(faiss_dir)
+    print("✅ Local FAISS index updated successfully!")
 
 if __name__ == "__main__":
     ingest_documents()

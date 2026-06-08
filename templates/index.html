@@ -4,56 +4,636 @@
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>RAG Chatbot</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css"/>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
 </head>
 <body>
-  <div class="chat-container">
-    <div class="chat-header">
-      🤖 RAG Chatbot
-      <span class="status">● Online</span>
+
+  <!-- ✅ LOGIN/SIGNUP MODAL -->
+  <div id="authModal" class="auth-modal">
+    <div class="auth-container">
+      <h2 id="authTitle">🔐 Login</h2>
+      
+      <form id="authForm" onsubmit="handleAuthSubmit(event)">
+        <input type="text" id="username" placeholder="Username" required>
+        <input type="email" id="email" placeholder="Email" style="display:none;">
+        <input type="password" id="password" placeholder="Password" required>
+        <button type="submit" class="auth-btn" id="authSubmitBtn">Login</button>
+      </form>
+      
+      <p id="toggleAuth" style="text-align: center; margin-top: 20px;">
+        Don't have an account? <a href="javascript:void(0)" onclick="toggleAuthMode()">Sign up</a>
+      </p>
+      <p id="authError" style="color: red; display:none; margin-top: 10px;"></p>
     </div>
-    <div class="chat-messages" id="messages"></div>
-    <div class="chat-input">
-      <input type="text" id="userInput" placeholder="Ask something from the docs..." />
-      <button onclick="sendMessage()">Send</button>
+  </div>
+
+  <!-- ✅ MAIN CHAT (hidden until logged in) -->
+  <div id="chatContainer" style="display:none;">
+    <div class="chat-container">
+      <div class="chat-header">
+        <div class="header-left">
+         <span class="header-logo">🤖</span>
+         <span class="header-title">RAG Chatbot</span>
+        </div>
+        <div class="header-right">
+         <span id="userDisplay"></span>
+         <button onclick="openDocumentsModal()" class="hdr-btn hdr-btn-docs">📁 Docs</button>
+         <button onclick="logout()" class="hdr-btn hdr-btn-logout">🚪 Logout</button>
+         <select id="translateLang" class="hdr-select">
+          <option value="">🌐 No Translation</option>
+          <option value="hi">🇮🇳 Hindi</option>
+          <option value="pa">🇮🇳 Punjabi</option>
+          <option value="es">🇪🇸 Spanish</option>
+          <option value="fr">🇫🇷 French</option>
+          <option value="de">🇩🇪 German</option>
+          <option value="zh">🇨🇳 Chinese</option>
+          <option value="ar">🇸🇦 Arabic</option>
+          <option value="ja">🇯🇵 Japanese</option>
+         </select>
+        </div>
+      </div>
+   
+      <div class="chat-messages" id="messages"></div>
+   
+      <div class="chat-input">
+        <button id="micBtn" onclick="toggleMic()" title="Speak your question">🎤</button>
+        <label id="uploadBtn" title="Upload PDF, TXT, or Images">
+          📎
+          <input type="file" id="fileInput" accept=".pdf,.txt,.jpg,.jpeg,.png,.bmp,.gif" style="display:none" onchange="uploadFile()" />
+        </label>
+        <input type="text" id="userInput" placeholder="Ask something or click 🎤 to speak..." />
+        <button onclick="sendMessage()">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ✅ DOCUMENTS MODAL -->
+  <div id="documentsModal" class="modal" style="display:none;">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>📁 My Documents</h2>
+        <button class="modal-close" onclick="closeDocumentsModal()">&times;</button>
+      </div>
+      
+      <div class="modal-body">
+        <div id="documentsList" class="documents-list"></div>
+      </div>
+      
+      <div class="modal-footer">
+        <button onclick="closeDocumentsModal()" class="modal-btn-close">Close</button>
+      </div>
     </div>
   </div>
 
   <script>
-    function addMessage(text, sender) {
-      const box = document.getElementById("messages");
-      const div = document.createElement("div");
-      div.className = `message ${sender}-message`;
-      div.textContent = text;
-      box.appendChild(div);
-      box.scrollTop = box.scrollHeight;
+    let isSignupMode = false;
+    let currentSession = "default_session";
+
+    marked.setOptions({ breaks: true, gfm: true });
+ 
+    // ✅ CHECK IF USER IS LOGGED IN ON PAGE LOAD
+    window.addEventListener('load', async () => {
+      try {
+        const response = await fetch('/current-user');
+        const data = await response.json();
+        
+        if (data.success) {
+          document.getElementById('authModal').style.display = 'none';
+          document.getElementById('chatContainer').style.display = 'block';
+          document.getElementById('userDisplay').textContent = `👤 ${data.user.username}`;
+          addMessage("Hi! Ask me anything 📄 Upload files with 📎 or use 🎤 mic!", "bot");
+        } else {
+          document.getElementById('authModal').style.display = 'flex';
+          document.getElementById('chatContainer').style.display = 'none';
+        }
+      } catch (error) {
+        console.error('Error checking user:', error);
+        document.getElementById('authModal').style.display = 'flex';
+        document.getElementById('chatContainer').style.display = 'none';
+      }
+    });
+
+    // ✅ TOGGLE BETWEEN LOGIN AND SIGNUP
+    function toggleAuthMode() {
+      isSignupMode = !isSignupMode;
+      const title = document.getElementById('authTitle');
+      const emailField = document.getElementById('email');
+      const submitBtn = document.getElementById('authSubmitBtn');
+      const toggle = document.getElementById('toggleAuth');
+      const errorDiv = document.getElementById('authError');
+      
+      document.getElementById('authForm').reset();
+      errorDiv.style.display = 'none';
+      
+      if (isSignupMode) {
+        title.textContent = '📝 Sign Up';
+        emailField.style.display = 'block';
+        emailField.required = true;
+        submitBtn.textContent = 'Create Account';
+        toggle.innerHTML = 'Already have an account? <a href="javascript:void(0)" onclick="toggleAuthMode()">Login</a>';
+      } else {
+        title.textContent = '🔐 Login';
+        emailField.style.display = 'none';
+        emailField.required = false;
+        submitBtn.textContent = 'Login';
+        toggle.innerHTML = 'Don\'t have an account? <a href="javascript:void(0)" onclick="toggleAuthMode()">Sign up</a>';
+      }
     }
 
+    // ✅ HANDLE LOGIN/SIGNUP SUBMISSION
+    async function handleAuthSubmit(e) {
+      e.preventDefault();
+      
+      const username = document.getElementById('username').value.trim();
+      const password = document.getElementById('password').value.trim();
+      const email = document.getElementById('email').value.trim();
+      const errorDiv = document.getElementById('authError');
+      const submitBtn = document.getElementById('authSubmitBtn');
+      
+      if (!username || !password) {
+        errorDiv.textContent = '❌ Please fill in all fields!';
+        errorDiv.style.display = 'block';
+        return;
+      }
+      
+      if (isSignupMode && !email) {
+        errorDiv.textContent = '❌ Email is required for signup!';
+        errorDiv.style.display = 'block';
+        return;
+      }
+      
+      const endpoint = isSignupMode ? '/signup' : '/login';
+      const payload = isSignupMode 
+        ? { username, email, password }
+        : { username, password };
+      
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Please wait...';
+      
+      try {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        
+        const data = await response.json();
+        
+        if (data.success) {
+          errorDiv.style.display = 'none';
+          document.getElementById('authModal').style.display = 'none';
+          document.getElementById('chatContainer').style.display = 'block';
+          document.getElementById('userDisplay').textContent = `👤 ${data.user.username}`;
+          document.getElementById('authForm').reset();
+          isSignupMode = false;
+          addMessage("Hi! Ask me anything 📄 Upload files with 📎 or use 🎤 mic!", "bot");
+        } else {
+          errorDiv.textContent = `❌ ${data.message}`;
+          errorDiv.style.display = 'block';
+        }
+      } catch (error) {
+        errorDiv.textContent = `❌ Error: ${error.message}`;
+        errorDiv.style.display = 'block';
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = isSignupMode ? 'Create Account' : 'Login';
+      }
+    }
+
+    // ✅ LOGOUT
+    async function logout() {
+      try {
+        await fetch('/logout', { method: 'POST' });
+        location.reload();
+      } catch (error) {
+        console.error('Logout error:', error);
+        location.reload();
+      }
+    }
+
+    // --- MIC ---
+    let recognition = null;
+    let isListening = false;
+ 
+    function setupMic() {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SpeechRecognition) {
+        alert("Sorry, your browser doesn't support voice input. Please use Chrome.");
+        return null;
+      }
+      const rec = new SpeechRecognition();
+      rec.continuous = false;
+      rec.interimResults = true;
+      rec.lang = 'en-US';
+ 
+      rec.onstart = () => {
+        isListening = true;
+        document.getElementById("micBtn").classList.add("mic-active");
+        document.getElementById("micBtn").innerHTML = "🔴";
+        document.getElementById("userInput").placeholder = "Listening...";
+      };
+ 
+      rec.onresult = (event) => {
+        const transcript = Array.from(event.results)
+          .map(r => r[0].transcript).join('');
+        document.getElementById("userInput").value = transcript;
+      };
+ 
+      rec.onend = () => {
+        isListening = false;
+        document.getElementById("micBtn").classList.remove("mic-active");
+        document.getElementById("micBtn").innerHTML = "🎤";
+        document.getElementById("userInput").placeholder = "Ask something or click 🎤 to speak...";
+        const text = document.getElementById("userInput").value.trim();
+        if (text) sendMessage();
+      };
+ 
+      rec.onerror = () => {
+        isListening = false;
+        document.getElementById("micBtn").classList.remove("mic-active");
+        document.getElementById("micBtn").innerHTML = "🎤";
+        document.getElementById("userInput").placeholder = "Ask something or click 🎤 to speak...";
+      };
+ 
+      return rec;
+    }
+ 
+    function toggleMic() {
+      if (!recognition) recognition = setupMic();
+      if (!recognition) return;
+      if (isListening) {
+        recognition.stop();
+      } else {
+        document.getElementById("userInput").value = "";
+        recognition.start();
+      }
+    }
+ 
+    // --- TRANSLATION ---
+    async function translateText(text, targetLang) {
+      if (!targetLang) return text;
+      try {
+        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${targetLang}&dt=t&q=${encodeURIComponent(text)}`;
+        const res = await fetch(url);
+        const data = await res.json();
+        return data[0].map(item => item[0]).join('');
+      } catch (e) {
+        return text;
+      }
+    }
+ 
+    // --- TEXT TO SPEECH ---
+    function speakText(text, lang) {
+      window.speechSynthesis.cancel();
+      const plain = text.replace(/[#*`_~>\-]/g, '').replace(/\n/g, ' ');
+      const utterance = new SpeechSynthesisUtterance(plain);
+      utterance.lang = lang || 'en-US';
+      utterance.rate = 1;
+      utterance.pitch = 1;
+      window.speechSynthesis.speak(utterance);
+    }
+ 
+    // --- TIMESTAMP ---
+    function getTime() {
+      return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+ 
+    // --- TYPEWRITER ---
+    function typewriterEffect(element, html, speed = 8) {
+      const temp = document.createElement('div');
+      temp.innerHTML = html;
+      const fullText = temp.innerHTML;
+      element.innerHTML = '';
+      let i = 0;
+      const interval = setInterval(() => {
+        element.innerHTML = fullText.substring(0, i);
+        i += 3;
+        if (i >= fullText.length) {
+          element.innerHTML = fullText;
+          clearInterval(interval);
+        }
+      }, speed);
+    }
+ 
+    // --- ADD MESSAGE ---
+    function addMessage(text, sender, translatedText, lang, useTypewriter = false, retrieval_info = "", cache_source = "") {
+      const box = document.getElementById("messages");
+      if (!box) return;
+      
+      const wrapper = document.createElement("div");
+      wrapper.className = `message-wrapper ${sender}-wrapper`;
+ 
+      const avatar = document.createElement("div");
+      avatar.className = `avatar ${sender}-avatar`;
+      avatar.textContent = sender === 'bot' ? '🤖' : '🧑';
+ 
+      const contentCol = document.createElement("div");
+      contentCol.className = "content-col";
+ 
+      const div = document.createElement("div");
+      div.className = `message ${sender}-message`;
+ 
+      const displayText = translatedText || text;
+ 
+      if (sender === 'bot') {
+        const rendered = marked.parse(displayText);
+        if (useTypewriter) {
+          typewriterEffect(div, rendered);
+        } else {
+          div.innerHTML = rendered;
+        }
+      } else {
+        div.textContent = displayText;
+      }
+ 
+      const timestamp = document.createElement("div");
+      timestamp.className = "timestamp";
+      timestamp.textContent = getTime();
+ 
+      contentCol.appendChild(div);
+      contentCol.appendChild(timestamp);
+ 
+      if (sender === 'bot' && retrieval_info) {
+        const infoDiv = document.createElement("div");
+        infoDiv.className = "retrieval-info";
+        infoDiv.innerHTML = `<small>${retrieval_info}</small>`;
+        contentCol.appendChild(infoDiv);
+      }
+ 
+      if (sender === 'bot' && cache_source && cache_source !== 'NONE') {
+        const cacheDiv = document.createElement("div");
+        cacheDiv.className = "cache-badge";
+        let emoji = '⚡';
+        if (cache_source === 'REDIS') emoji = '🚀';
+        if (cache_source === 'SEMANTIC') emoji = '🧠';
+        cacheDiv.textContent = `${emoji} ${cache_source}`;
+        contentCol.appendChild(cacheDiv);
+      }
+ 
+      if (sender === 'bot') {
+        wrapper.appendChild(avatar);
+        wrapper.appendChild(contentCol);
+      } else {
+        wrapper.appendChild(contentCol);
+        wrapper.appendChild(avatar);
+      }
+ 
+      if (sender === 'bot') {
+        const controls = document.createElement("div");
+        controls.className = "msg-controls";
+ 
+        const speakBtn = document.createElement("button");
+        speakBtn.className = "icon-btn";
+        speakBtn.title = "Read aloud";
+        speakBtn.innerHTML = "🔊";
+        speakBtn.onclick = () => speakText(displayText, lang);
+ 
+        const stopBtn = document.createElement("button");
+        stopBtn.className = "icon-btn";
+        stopBtn.title = "Stop speaking";
+        stopBtn.innerHTML = "⏹️";
+        stopBtn.onclick = () => window.speechSynthesis.cancel();
+ 
+        const copyBtn = document.createElement("button");
+        copyBtn.className = "icon-btn";
+        copyBtn.title = "Copy";
+        copyBtn.innerHTML = "📋";
+        copyBtn.onclick = () => {
+          navigator.clipboard.writeText(displayText);
+          copyBtn.innerHTML = "✅";
+          setTimeout(() => copyBtn.innerHTML = "📋", 1500);
+        };
+ 
+        controls.appendChild(speakBtn);
+        controls.appendChild(stopBtn);
+        controls.appendChild(copyBtn);
+        contentCol.appendChild(controls);
+      }
+ 
+      box.appendChild(wrapper);
+      box.scrollTop = box.scrollHeight;
+    }
+ 
+    // --- FILE UPLOAD ---
+    async function uploadFile() {
+      const fileInput = document.getElementById("fileInput");
+      const file = fileInput.files[0];
+      if (!file) return;
+ 
+      const formData = new FormData();
+      formData.append("file", file);
+ 
+      const isImage = ["image/jpeg", "image/png", "image/jpg", "image/bmp", "image/gif"].includes(file.type);
+      
+      if (isImage) {
+        addMessage(`🖼️ Uploading image "${file.name}" (will extract text with OCR)...`, "user");
+      } else {
+        addMessage(`📎 Uploading "${file.name}"...`, "user");
+      }
+ 
+      const box = document.getElementById("messages");
+      const thinking = document.createElement("div");
+      thinking.className = "message-wrapper bot-wrapper";
+      thinking.id = "upload-indicator";
+      thinking.innerHTML = `
+        <div class="avatar bot-avatar">🤖</div>
+        <div class="message bot-message typing-dots">
+          <span></span><span></span><span></span>
+        </div>`;
+      box.appendChild(thinking);
+      box.scrollTop = box.scrollHeight;
+ 
+      try {
+        const res = await fetch("/upload", {
+          method: "POST",
+          body: formData
+        });
+ 
+        const data = await res.json();
+        document.getElementById("upload-indicator")?.remove();
+ 
+        if (data.success) {
+          addMessage(data.message, "bot");
+        } else {
+          addMessage(`❌ ${data.message}`, "bot");
+        }
+      } catch (e) {
+        document.getElementById("upload-indicator")?.remove();
+        addMessage("❌ Upload failed. Please try again.", "bot");
+      }
+ 
+      fileInput.value = "";
+    }
+ 
+    // --- SEND MESSAGE ---
     async function sendMessage() {
       const input = document.getElementById("userInput");
       const text = input.value.trim();
       if (!text) return;
-
+ 
+      const targetLang = document.getElementById("translateLang").value;
       addMessage(text, "user");
       input.value = "";
-      addMessage("Thinking...", "bot");
-
-      const res = await fetch("/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text })
-      });
-
-      const data = await res.json();
-      const messages = document.getElementById("messages");
-      messages.lastChild.textContent = data.reply;
+ 
+      const box = document.getElementById("messages");
+      const typingWrapper = document.createElement("div");
+      typingWrapper.className = "message-wrapper bot-wrapper";
+      typingWrapper.id = "typing-indicator";
+      typingWrapper.innerHTML = `
+        <div class="avatar bot-avatar">🤖</div>
+        <div class="message bot-message typing-dots">
+          <span></span><span></span><span></span>
+        </div>`;
+      box.appendChild(typingWrapper);
+      box.scrollTop = box.scrollHeight;
+ 
+      try {
+        const res = await fetch("/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: text, session_id: currentSession })
+        });
+ 
+        const data = await res.json();
+        
+        if (data.error === 'not_authenticated') {
+          document.getElementById("typing-indicator")?.remove();
+          addMessage('Session expired. Please login again.', "bot");
+          setTimeout(() => location.reload(), 2000);
+        } else {
+          const reply = data.reply;
+          const retrieval_info = data.retrieval_info || "";
+          const cache_source = data.cache_source || "";
+          const translated = await translateText(reply, targetLang);
+      
+          document.getElementById("typing-indicator")?.remove();
+          addMessage(reply, "bot", translated, targetLang, true, retrieval_info, cache_source);
+      
+          if (targetLang) speakText(translated, targetLang);
+        }
+ 
+      } catch (e) {
+        document.getElementById("typing-indicator")?.remove();
+        addMessage("Error getting response. Please try again.", "bot");
+      }
     }
-
-    document.getElementById("userInput").addEventListener("keydown", e => {
+ 
+    document.getElementById("userInput")?.addEventListener("keydown", e => {
       if (e.key === "Enter") sendMessage();
     });
 
-    window.onload = () => addMessage("Hi! Ask me anything from the documents 📄", "bot");
+    // --- DOCUMENTS MODAL ---
+    function openDocumentsModal() {
+      document.getElementById('documentsModal').style.display = 'flex';
+      loadDocuments();
+    }
+
+    function closeDocumentsModal() {
+      document.getElementById('documentsModal').style.display = 'none';
+    }
+
+    async function loadDocuments() {
+      try {
+        const response = await fetch('/documents');
+        const data = await response.json();
+        
+        if (data.success) {
+          displayDocuments(data.files);
+        } else {
+          document.getElementById('documentsList').innerHTML = `<p style="color: red;">❌ ${data.message}</p>`;
+        }
+      } catch (error) {
+        document.getElementById('documentsList').innerHTML = `<p style="color: red;">❌ Error loading documents: ${error.message}</p>`;
+      }
+    }
+
+    function displayDocuments(files) {
+  const list = document.getElementById('documentsList');
+  
+  if (files.length === 0) {
+    list.innerHTML = '<p style="text-align: center; color: #999; padding: 40px;">📭 No documents uploaded yet. Upload one to get started!</p>';
+    return;
+  }
+  
+  let html = '<div class="documents-list">';
+  files.forEach(file => {
+    const filePath = `/documents/${encodeURIComponent(file.name)}`;
+    html += `
+      <div class="doc-item">
+        <div class="doc-info">
+          <div class="doc-name">📄 ${file.name}</div>
+          <div class="doc-meta">
+            <span>📊 ${file.size}</span>
+            <span>📦 ${file.chunks} chunks</span>
+            <span>🏷️ ${file.version || 'v1'}</span>
+            <span>⏰ ${new Date(file.uploaded).toLocaleDateString()}</span>
+          </div>
+        </div>
+        <div class="doc-actions">
+          <button onclick="openFile('${file.name}')" class="doc-btn doc-open-btn" title="Open file">👁️ View</button>
+          <button onclick="deleteFile('${file.name}')" class="doc-btn doc-delete-btn" title="Delete file">🗑️ Delete</button>
+        </div>
+      </div>
+    `;
+  });
+  html += '</div>';
+  list.innerHTML = html;
+}
+    async function deleteFile(filename) {
+      if (!confirm(`Are you sure you want to delete "${filename}"?`)) {
+        return;
+      }
+      
+      try {
+        const response = await fetch(`/documents/${filename}`, {
+          method: 'DELETE'
+        });
+        
+        const data = await response.json();
+        
+        if (data.success) {
+          alert('✅ ' + data.message);
+          loadDocuments();
+        } else {
+          alert('❌ ' + data.message);
+        }
+      } catch (error) {
+        alert('❌ Error deleting file: ' + error.message);
+      }
+    }
+    function openFile(filename) {
+    const fileExt = filename.split('.').pop().toLowerCase();
+    
+    // CHANGE THE PATH HERE from /documents/ to /view_document/
+    const viewUrl = `/view_document/${encodeURIComponent(filename)}`;
+
+    if (['pdf', 'txt'].includes(fileExt)) {
+        // Open PDF/TXT in new tab
+        window.open(viewUrl, '_blank');
+    } else if (['jpg', 'jpeg', 'png', 'bmp', 'gif'].includes(fileExt)) {
+        // Show image in modal
+        const imageModal = document.createElement('div');
+        // ... (your existing modal CSS) ...
+        
+        const img = document.createElement('img');
+        img.src = viewUrl; // Use the new route here
+        
+        // ... (rest of your modal logic) ...
+        imageModal.appendChild(img);
+        imageModal.onclick = () => imageModal.remove();
+        document.body.appendChild(imageModal);
+    } else {
+        alert('❌ Cannot preview this file type');
+    }
+}
+  document.addEventListener('click', function(event) {
+      const modal = document.getElementById('documentsModal');
+      if (event.target === modal) {
+        closeDocumentsModal();
+      }
+    });
   </script>
 </body>
 </html>
