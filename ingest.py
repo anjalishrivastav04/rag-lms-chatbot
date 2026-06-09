@@ -4,6 +4,7 @@ import hashlib
 import glob
 import redis
 from dotenv import load_dotenv
+from graph_handler import build_graph_from_chunks, delete_graph_for_file
 
 # 🚨 CRITICAL: Load environment variables BEFORE initializing any LangChain or local vision tools
 load_dotenv()
@@ -257,7 +258,7 @@ def ingest_documents():
                                 path, 
                                 first_page=page_num + 1, 
                                 last_page=page_num + 1, 
-                                dpi=200,
+                                dpi=300,
                                 poppler_path=POPPLER_PATH
                             )
                             if images:
@@ -339,6 +340,8 @@ def ingest_documents():
 
             all_chunks.extend(chunks)
             print(f"   ... ADDED: {len(chunks)} chunks\n")
+
+            build_graph_from_chunks(chunks, filename)
             
             # Cache the successful hash state mapping inside Redis
             redis_client.set(f"fastpass_hash:{filename}", file_disk_hash)

@@ -6,6 +6,12 @@ import redis
 import shutil
 import hashlib
 import re
+import numpy as np
+import hashlib
+import json
+from sentence_transformers import SentenceTransformer
+from datetime import datetime, timedelta
+from sklearn.metrics.pairwise import cosine_similarity
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask import session
 from functools import wraps
@@ -20,13 +26,18 @@ from langchain_core.documents import Document
 from ocr_handler import save_ocr_text_to_file, extract_text_from_image
 from flashrank import Ranker, RerankRequest
 from werkzeug.utils import secure_filename
+from apscheduler.schedulers.background import BackgroundScheduler
 from ingest import ingest_documents
+from graph_handler import graph_retrieve, delete_graph_for_file
 from dotenv import load_dotenv
 from sqlalchemy import func
  
 load_dotenv()
 os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY", "")
 app = Flask(__name__)
+# ✅ Initialize embedder for semantic cache
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
+print("✅ Embedder loaded successfully!")
 app.secret_key = "123456"
 # --- FILE UPLOAD CONFIG ---
 UPLOAD_FOLDER = "documents"
@@ -110,6 +121,149 @@ class ProcessedFile(db.Model):
             "chunk_count": self.chunk_count,
             "version": self.version
         }
+
+# --- SEMANTIC CACHE MODEL (with TTL) ---
+class SemanticCacheRecord(db.Model):
+    __tablename__ = 'semantic_cache'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    query_text = db.Column(db.Text, nullable=False)
+    query_embedding = db.Column(db.Text)  # Store as JSON string
+    response = db.Column(db.Text, nullable=False)
+    content_type = db.Column(db.String(50), default='general')
+    hit_count = db.Column(db.Integer, default=1)
+    created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now())
+    expires_at = db.Column(db.DateTime(timezone=True), nullable=False)
+    
+    def is_expired(self):
+        """Check if cache entry has expired"""
+        from datetime import datetime
+        return datetime.utcnow() > self.expires_at
+    
+    def time_remaining(self):
+        """Get human-readable time remaining"""
+        from datetime import datetime
+        if self.is_expired():
+            return "Expired"
+        delta = self.expires_at - datetime.utcnow()
+        hours = delta.total_seconds() / 3600
+        return f"{hours:.1f} hours"
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'query': self.query_text,
+            'response': self.response,
+            'content_type': self.content_type,
+            'hits': self.hit_count,
+            'created': str(self.created_at),
+            'expires': str(self.expires_at),
+            'ttl_remaining': self.time_remaining()
+        }
+# --- TTL CONFIGURATION ---
+CONTENT_TTL = {
+    'lecture_notes': 24,           # hours
+    'assignments': 7 * 24,         # 7 days
+    'grades': 2,                   # 2 hours
+    'syllabus': 90 * 24,           # 90 days
+    'announcements': 12,           # 12 hours
+    'course_handbook': 60 * 24,    # 60 days
+}
+DEFAULT_TTL = 24  # hours
+
+# --- CACHE STORAGE FUNCTION ---
+def cache_response_with_ttl(user_id, query_text, query_embedding, response, content_type='general'):
+    """Store response in semantic cache with TTL"""
+    
+    try:
+        # Get TTL for this content type
+        ttl_hours = CONTENT_TTL.get(content_type, DEFAULT_TTL)
+        
+        # Calculate expiry time
+        expires_at = datetime.utcnow() + timedelta(hours=ttl_hours)
+        
+        # Convert embedding to JSON string
+        embedding_str = json.dumps(query_embedding.tolist() if hasattr(query_embedding, 'tolist') else query_embedding)
+        
+        # Create cache record
+        cache_record = SemanticCacheRecord(
+            user_id=user_id,
+            query_text=query_text,
+            query_embedding=embedding_str,
+            response=response,
+            content_type=content_type,
+            expires_at=expires_at
+        )
+        
+        db.session.add(cache_record)
+        db.session.commit()
+        
+        print(f"✅ Cached '{content_type}' for {ttl_hours} hours")
+        return expires_at
+        
+    except Exception as e:
+        print(f"❌ Cache store error: {e}")
+        db.session.rollback()
+        return None
+
+# --- CACHE RETRIEVAL FUNCTION ---
+def get_cached_response(user_id, query_embedding, threshold=0.85):
+    """Get cached response if similar query exists (and not expired)"""
+    
+    try:
+        cached_records = SemanticCacheRecord.query.filter(
+            SemanticCacheRecord.user_id == user_id,
+            SemanticCacheRecord.expires_at > datetime.utcnow()
+        ).all()
+        
+        if not cached_records:
+            return None, None, 0
+        
+        best_match = None
+        best_similarity = 0
+        
+        for record in cached_records:
+            cached_embedding = np.array(json.loads(record.query_embedding))
+            similarity = cosine_similarity(
+                [query_embedding],
+                [cached_embedding]
+            )[0][0]
+            
+            if similarity > best_similarity and similarity > threshold:
+                best_similarity = similarity
+                best_match = record
+        
+        if best_match:
+            best_match.hit_count += 1
+            db.session.commit()
+            return best_match.response, best_match.content_type, best_similarity
+        
+        return None, None, 0
+        
+    except Exception as e:
+        print(f"❌ Cache retrieval error: {e}")
+        return None, None, 0
+# --- CLEANUP EXPIRED CACHE ---
+def cleanup_expired_cache():
+    """Delete expired cache entries"""
+    
+    try:
+        expired_count = SemanticCacheRecord.query.filter(
+            SemanticCacheRecord.expires_at < datetime.utcnow()
+        ).delete()
+        
+        db.session.commit()
+        
+        if expired_count > 0:
+            print(f"🗑️ Cleaned up {expired_count} expired cache entries")
+        
+        return expired_count
+        
+    except Exception as e:
+        print(f"❌ Cache cleanup error: {e}")
+        db.session.rollback()
+        return 0
     
 # --- DB HELPERS ---
 def save_chat_message(user_id, session_id, role, content, cache_source='NONE', response_time_ms=0):
@@ -169,8 +323,8 @@ def initialize_vectorstore():
 vectorstore, ALL_DOCS = initialize_vectorstore()
  
 # --- HYBRID RETRIEVER SETUP ---
-dense_retriever = vectorstore.as_retriever(search_kwargs={"k": 6})
-bm25_retriever = BM25Retriever.from_documents(ALL_DOCS, k=6)
+dense_retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+bm25_retriever = BM25Retriever.from_documents(ALL_DOCS, k=10)
  
 RRF_K = 60
  
@@ -193,7 +347,6 @@ def reciprocal_rank_fusion(bm25_docs, dense_docs):
     return [doc_map[k] for k in ranked_keys]
  
 def hybrid_retrieve(question):
-    """Run BM25 + FAISS in parallel, merge with RRF."""
     bm25_docs = bm25_retriever.invoke(question)
     dense_docs = dense_retriever.invoke(question)
     return reciprocal_rank_fusion(bm25_docs, dense_docs)
@@ -321,7 +474,29 @@ Answer:"""
         return cached, "SEMANTIC", ""
  
     docs = hybrid_retrieve(question)
-    docs = rerank_documents(question, docs, top_n=3)
+    docs = rerank_documents(question, docs, top_n=6)
+
+    # 🔗 GRAPH RAG - Get knowledge graph context
+
+    
+    # 🔗 GRAPH RAG - Multi-hop traversal
+    graph_context, related_entities = graph_retrieve(question)
+
+    
+    extra_docs = []
+    if related_entities:
+      for entity in related_entities[:5]:
+        entity_docs = dense_retriever.invoke(entity)
+        extra_docs.extend(entity_docs)
+    
+    # Merge extra docs with original docs (avoid duplicates)
+      existing_contents = {doc.page_content for doc in docs}
+      for doc in extra_docs:
+        if doc.page_content not in existing_contents:
+            docs.append(doc)
+            existing_contents.add(doc.page_content)
+    
+      print(f"🔗 Added {len(extra_docs)} extra chunks via graph entity search")
  
     if not docs or (len(docs) == 1 and docs[0].metadata.get("source") == "system"):
         return "I don't have any uploaded documents to extract information from right now.", "NONE", ""
@@ -341,20 +516,25 @@ Answer:"""
     retrieval_info = f"📊 Retrieved using: {int(alpha*100)}% Semantic (FAISS) + {int((1-alpha)*100)}% Keyword (BM25)\n📎 Sources: {', '.join(sources_set)}"
     past_history = get_past_chat_history(session_id, limit=6)
  
-    prompt = f"""You are an expert document assistant. You are provided with OCR text from a document.
-      You must answer ONLY using the provided OCR text. If the document mentions a year, use that year. 
-      Do not use the current date or your internal knowledge of the year 2026 to answer questions. 
-      If the information is not in the text, state that you do not have the information
- 
+    prompt =  f"""You are an expert document assistant. You are provided with context from multiple documents.
+      You must answer using ALL relevant information from the provided context.
+      If multiple documents contain relevant information, combine and summarize from ALL of them.
+      If the document mentions a year, use that year.
+      Do not use the current date or your internal knowledge of the year 2026 to answer questions.
+      If the information is not in the context at all, state that you do not have the information.
+
 ### PAST CONVERSATION:
 {past_history}
- 
+
+### KNOWLEDGE GRAPH:
+{graph_context}
+
 ### CONTEXT:
 {context}
- 
+
 ### QUESTION:
 {question}
- 
+
 Answer:"""
  
     response = llm.invoke(prompt)
@@ -410,10 +590,8 @@ def save_processed_file_info(user_id, filename, filepath, chunk_count):
 @app.route("/")
 def index():
     return render_template("index.html")
- 
 @app.route("/chat", methods=["POST"])
 def chat():
-    # ✅ CHECK IF USER IS LOGGED IN
     user_id = session.get('user_id')
     if not user_id:
         return jsonify({"reply": "Please login first!", "error": "not_authenticated"})
@@ -437,10 +615,74 @@ def chat():
  
     try:
         start_time = time.time()
-        save_chat_message(user_id, session_id, "user", user_message)  # ✅ Pass user_id
+        save_chat_message(user_id, session_id, "user", user_message)
+        
+        # ✅ TIER 0: Redis (FASTEST - Check FIRST!)
+        exact_cache_key = f"user:{user_id}:exact:{hashlib.md5(user_message.encode()).hexdigest()}"
+        redis_cached = redis_client.get(exact_cache_key)
+        
+        if redis_cached:
+            duration = int((time.time() - start_time) * 1000)
+            cached_data = json.loads(redis_cached)
+            save_chat_message(user_id, session_id, "assistant", cached_data['reply'], 
+                            cache_source="REDIS_EXACT", response_time_ms=duration)
+            
+            return jsonify({
+                "reply": cached_data['reply'],
+                "retrieval_info": cached_data.get('retrieval_info', ''),
+                "cache_source": "REDIS_EXACT ⚡",
+                "duration_ms": duration,
+                "user": user.username
+            })
+        
+        # ✅ TIER 1: Semantic Cache (SMART - Check SECOND!)
+        query_embedding = embedder.encode(user_message)
+        cached_response, content_type, similarity = get_cached_response(
+            user_id, 
+            query_embedding, 
+            threshold=0.85
+        )
+        
+        if cached_response:
+            duration = int((time.time() - start_time) * 1000)
+            save_chat_message(user_id, session_id, "assistant", cached_response, 
+                            cache_source="SEMANTIC_CACHE", response_time_ms=duration)
+            
+            return jsonify({
+                "reply": cached_response,
+                "retrieval_info": f"Similarity: {similarity:.2%}",
+                "cache_source": f"SEMANTIC_CACHE ({content_type}) 🧠",
+                "duration_ms": duration,
+                "user": user.username
+            })
+        
+        # ✅ TIER 2: Full Pipeline (EXPENSIVE)
         reply, cache_source, retrieval_info = get_answer(user_message, session_id)
         duration = int((time.time() - start_time) * 1000)
-        save_chat_message(user_id, session_id, "assistant", reply, cache_source=cache_source, response_time_ms=duration)  # ✅ Pass user_id
+        
+        # ✅ Store in BOTH caches
+        # Store in Redis (exact match)
+        redis_client.setex(
+            exact_cache_key,
+            3600,  # 1 hour
+            json.dumps({
+                'reply': reply,
+                'retrieval_info': retrieval_info,
+                'cache_source': cache_source
+            })
+        )
+        
+        # Store in Semantic Cache (similarity)
+        cache_response_with_ttl(
+            user_id=user_id,
+            query_text=user_message,
+            query_embedding=query_embedding,
+            response=reply,
+            content_type='general'
+        )
+        
+        save_chat_message(user_id, session_id, "assistant", reply, 
+                        cache_source=cache_source, response_time_ms=duration)
         
         return jsonify({
             "reply": reply,
@@ -451,7 +693,6 @@ def chat():
         })
     except Exception as e:
         return jsonify({"reply": f"Error: {str(e)}"})
- 
 @app.route("/upload", methods=["POST"])
 def upload_file():
     # ✅ CHECK IF USER IS LOGGED IN
@@ -578,6 +819,7 @@ def delete_document(filename):
                 os.remove("record_manager_cache.db")
         else:
             ingest_documents()
+            delete_graph_for_file(filename)
 
         reload_vectorstore()
         return jsonify({"success": True, "message": f"🗑️ '{filename}' deleted successfully!"})
@@ -690,6 +932,19 @@ def view_document(filename):
         return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
     except FileNotFoundError:
         abort(404)
+
+# ✅ AUTOMATIC CACHE CLEANUP (runs every hour)
+def scheduled_cleanup():
+    """Background job to clean expired cache"""
+    with app.app_context():
+        cleanup_expired_cache()
+
+# Start scheduler
+scheduler = BackgroundScheduler()
+scheduler.add_job(scheduled_cleanup, 'interval', hours=4)
+scheduler.start()
+
+print("✅ Cache cleanup scheduler started (runs every 4 hour)")
  
 if __name__ == "__main__":
     with app.app_context():
@@ -697,3 +952,5 @@ if __name__ == "__main__":
     # Force runtime validation mapping check right at execution launch
     reload_vectorstore()
     app.run(debug=True)     
+if __name__ == "__main__":
+    app.run(debug=True)
