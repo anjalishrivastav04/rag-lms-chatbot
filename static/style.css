@@ -10,7 +10,7 @@ body {
 }
 
 .chat-container {
-  width: 480px;
+  width: 580px;  /* ✅ Changed from 480px to 580px */
   height: 620px;
   background: #ffffff;
   border-radius: 16px;
@@ -50,9 +50,9 @@ body {
 .header-right {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;       /* ✅ Reduced from 6px */
   flex-wrap: nowrap;
-  overflow: hidden;
+  overflow: visible;  /* ✅ Changed from hidden */
 }
 
 #userDisplay {
@@ -68,8 +68,8 @@ body {
 .hdr-btn {
   border: none;
   border-radius: 6px;
-  padding: 5px 10px;
-  font-size: 12px;
+  padding: 4px 8px;    /* ✅ Reduced padding */
+  font-size: 11px;     /* ✅ Reduced from 12px */
   font-weight: 600;
   cursor: pointer;
   white-space: nowrap;
@@ -95,10 +95,10 @@ body {
   color: white;
   border: 1px solid rgba(255, 255, 255, 0.3);
   border-radius: 6px;
-  padding: 5px 6px;
-  font-size: 12px;
+  padding: 4px 4px;    /* ✅ Reduced */
+  font-size: 11px;     /* ✅ Reduced */
   cursor: pointer;
-  max-width: 130px;
+  max-width: 100px;    /* ✅ Reduced from 130px */
   outline: none;
 }
 

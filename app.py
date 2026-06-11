@@ -9,6 +9,8 @@ import re
 import numpy as np
 import hashlib
 import json
+import threading
+from flask import Flask, request, jsonify, render_template, redirect
 from sentence_transformers import SentenceTransformer
 from datetime import datetime, timedelta
 from sklearn.metrics.pairwise import cosine_similarity
@@ -161,6 +163,30 @@ class SemanticCacheRecord(db.Model):
             'expires': str(self.expires_at),
             'ttl_remaining': self.time_remaining()
         }
+    
+# --- RESPONSE EVALUATOR MODEL ---
+class ResponseEvaluation(db.Model):
+    __tablename__ = 'response_evaluations'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    session_id = db.Column(db.String(255), nullable=False)
+    question = db.Column(db.Text, nullable=False)
+    answer = db.Column(db.Text, nullable=False)
+    context = db.Column(db.Text)
+    score = db.Column(db.Integer)  # 1-5
+    feedback = db.Column(db.Text)
+    evaluated_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now())
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'question': self.question,
+            'answer': self.answer,
+            'score': self.score,
+            'feedback': self.feedback,
+            'evaluated_at': str(self.evaluated_at)
+        }
+    
 # --- TTL CONFIGURATION ---
 CONTENT_TTL = {
     'lecture_notes': 24,           # hours
@@ -481,8 +507,6 @@ Answer:"""
     
     # 🔗 GRAPH RAG - Multi-hop traversal
     graph_context, related_entities = graph_retrieve(question)
-
-    
     extra_docs = []
     if related_entities:
       for entity in related_entities[:5]:
@@ -585,7 +609,67 @@ def save_processed_file_info(user_id, filename, filepath, chunk_count):
     except Exception as e:
         db.session.rollback()
         print(f"❌ Error saving file info: {e}")
+# --- RAG RESPONSE EVALUATOR ---
+def evaluate_response(question, answer, context, user_id, session_id):
+    """Evaluate RAG response quality using LLM and store in PostgreSQL."""
+    try:
+        eval_prompt = f"""You are an expert RAG evaluation system. Evaluate the following RAG response strictly.
 
+QUESTION: {question}
+
+RETRIEVED CONTEXT: {context[:1000]}
+
+GENERATED ANSWER: {answer}
+
+Rate the answer on a scale of 1-5 based on:
+- Relevance: Is the answer relevant to the question?
+- Faithfulness: Is the answer based on the provided context?
+- Completeness: Is the answer complete and helpful?
+
+Reply in this EXACT format only:
+SCORE: <number between 1-5>
+FEEDBACK: <one sentence explanation>
+
+Nothing else."""
+
+        eval_response = llm.invoke(eval_prompt)
+        content = eval_response.content.strip()
+
+        # Parse score and feedback
+        lines = content.split('\n')
+        score = 3  # default
+        feedback = "Evaluation completed"
+
+        for line in lines:
+            if line.startswith('SCORE:'):
+                try:
+                    score = int(line.replace('SCORE:', '').strip())
+                    score = max(1, min(5, score))  # clamp between 1-5
+                except:
+                    score = 3
+            elif line.startswith('FEEDBACK:'):
+                feedback = line.replace('FEEDBACK:', '').strip()
+
+        # Store in PostgreSQL
+        evaluation = ResponseEvaluation(
+            user_id=user_id,
+            session_id=session_id,
+            question=question,
+            answer=answer,
+            context=context[:2000],
+            score=score,
+            feedback=feedback
+        )
+        db.session.add(evaluation)
+        db.session.commit()
+
+        print(f"✅ Response evaluated — Score: {score}/5 | {feedback}")
+        return score, feedback
+
+    except Exception as e:
+        print(f"⚠️ Evaluation error: {e}")
+        db.session.rollback()
+        return None, None
 # --- ROUTES ---
 @app.route("/")
 def index():
@@ -624,9 +708,19 @@ def chat():
         if redis_cached:
             duration = int((time.time() - start_time) * 1000)
             cached_data = json.loads(redis_cached)
-            save_chat_message(user_id, session_id, "assistant", cached_data['reply'], 
+            save_chat_message(user_id, session_id, "assistant", cached_data['reply'],
                             cache_source="REDIS_EXACT", response_time_ms=duration)
             
+            # ✅ EVALUATE CACHED RESPONSE
+            
+            def run_evaluation():
+                with app.app_context():
+                    evaluate_response(user_message, cached_data['reply'], 
+                         cached_data.get('retrieval_info', ''), user_id, session_id)
+            eval_thread = threading.Thread(target=run_evaluation)
+            eval_thread.daemon = True
+            eval_thread.start()
+
             return jsonify({
                 "reply": cached_data['reply'],
                 "retrieval_info": cached_data.get('retrieval_info', ''),
@@ -648,6 +742,16 @@ def chat():
             save_chat_message(user_id, session_id, "assistant", cached_response, 
                             cache_source="SEMANTIC_CACHE", response_time_ms=duration)
             
+            # ✅ EVALUATE CACHED RESPONSE
+            
+            def run_evaluation():
+                with app.app_context():
+                     evaluate_response(user_message, cached_response, 
+                         f"Similarity: {similarity:.2%}", user_id, session_id)
+            eval_thread = threading.Thread(target=run_evaluation)
+            eval_thread.daemon = True
+            eval_thread.start()
+
             return jsonify({
                 "reply": cached_response,
                 "retrieval_info": f"Similarity: {similarity:.2%}",
@@ -661,10 +765,9 @@ def chat():
         duration = int((time.time() - start_time) * 1000)
         
         # ✅ Store in BOTH caches
-        # Store in Redis (exact match)
         redis_client.setex(
             exact_cache_key,
-            3600,  # 1 hour
+            3600,
             json.dumps({
                 'reply': reply,
                 'retrieval_info': retrieval_info,
@@ -672,7 +775,6 @@ def chat():
             })
         )
         
-        # Store in Semantic Cache (similarity)
         cache_response_with_ttl(
             user_id=user_id,
             query_text=user_message,
@@ -683,6 +785,15 @@ def chat():
         
         save_chat_message(user_id, session_id, "assistant", reply, 
                         cache_source=cache_source, response_time_ms=duration)
+
+        # ✅ EVALUATE FULL PIPELINE RESPONSE
+        
+        def run_evaluation():
+            with app.app_context():
+                evaluate_response(user_message, reply, retrieval_info, user_id, session_id)
+        eval_thread = threading.Thread(target=run_evaluation)
+        eval_thread.daemon = True
+        eval_thread.start()
         
         return jsonify({
             "reply": reply,
@@ -691,6 +802,7 @@ def chat():
             "duration_ms": duration,
             "user": user.username
         })
+
     except Exception as e:
         return jsonify({"reply": f"Error: {str(e)}"})
 @app.route("/upload", methods=["POST"])
@@ -945,7 +1057,121 @@ scheduler.add_job(scheduled_cleanup, 'interval', hours=4)
 scheduler.start()
 
 print("✅ Cache cleanup scheduler started (runs every 4 hour)")
- 
+
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    """Dashboard API - returns JSON data"""
+    user_id = session.get('user_id')
+    if not user_id:
+        return jsonify({"success": False, "message": "Please login first!"}), 401
+    
+    try:
+        results = db.session.execute(db.text("""
+    SELECT 
+        u.username,
+        user_msg.content as question,
+        asst_msg.content as answer,
+        asst_msg.cache_source,
+        asst_msg.response_time_ms,
+        re.score,
+        re.feedback,
+        user_msg.created_at
+    FROM chat_history user_msg
+    JOIN users u ON user_msg.user_id = u.id
+    LEFT JOIN chat_history asst_msg 
+        ON asst_msg.session_id = user_msg.session_id
+        AND asst_msg.role = 'assistant'
+        AND asst_msg.created_at > user_msg.created_at
+    LEFT JOIN response_evaluations re 
+        ON re.user_id = user_msg.user_id 
+        AND re.question = user_msg.content
+    WHERE user_msg.role = 'user'
+    ORDER BY user_msg.created_at DESC
+    LIMIT 100
+""")).fetchall() 
+        stats = db.session.execute(db.text("""
+    SELECT 
+        (SELECT COUNT(*) FROM chat_history 
+         WHERE role = 'user') as total_queries,
+        
+        (SELECT ROUND(AVG(score), 2) 
+         FROM response_evaluations) as avg_score,
+        
+        (SELECT COUNT(*) FROM chat_history 
+         WHERE role = 'assistant' 
+         AND cache_source IS NOT NULL
+         AND cache_source NOT IN ('NONE', '')) as cache_hits,
+        
+        ROUND(
+            (SELECT COUNT(*) FROM chat_history 
+             WHERE role = 'assistant' 
+             AND cache_source IS NOT NULL
+             AND cache_source NOT IN ('NONE', '')) * 100.0 /
+            NULLIF(
+                (SELECT COUNT(*) FROM chat_history 
+                 WHERE role = 'assistant'), 0
+            ), 2
+        ) as cache_hit_rate
+""")).fetchone()
+        
+        cache_breakdown = db.session.execute(db.text("""
+    SELECT 
+        CASE 
+            WHEN cache_source LIKE '%REDIS%' THEN 'REDIS'
+            WHEN cache_source LIKE '%SEMANTIC%' THEN 'SEMANTIC CACHE'
+            ELSE 'FULL PIPELINE'
+        END as cache_source,
+        COUNT(*) as count,
+        ROUND(AVG(response_time_ms), 0) as avg_ms
+    FROM chat_history
+    WHERE role = 'assistant'
+    AND cache_source IS NOT NULL
+    GROUP BY 
+        CASE 
+            WHEN cache_source LIKE '%REDIS%' THEN 'REDIS'
+            WHEN cache_source LIKE '%SEMANTIC%' THEN 'SEMANTIC CACHE'
+            ELSE 'FULL PIPELINE'
+        END
+    ORDER BY count DESC
+""")).fetchall()
+        
+        return jsonify({
+            "success": True,
+            "data": [{
+                "username": r.username,
+                "question": r.question,
+                "answer": r.answer,
+                "cache_source": r.cache_source,
+                "response_time_ms": r.response_time_ms,
+                "score": r.score,
+                "feedback": r.feedback,
+                "created_at": str(r.created_at)
+            } for r in results],
+            "stats": {
+                "total_queries": stats.total_queries or 0,
+                "avg_score": float(stats.avg_score) if stats.avg_score else 0,
+                "cache_hits": stats.cache_hits or 0,
+                "cache_hit_rate": float(stats.cache_hit_rate) if stats.cache_hit_rate else 0
+            },
+            "cache_breakdown": [{
+                "cache_source": c.cache_source,
+                "count": c.count,
+                "avg_ms": float(c.avg_ms) if c.avg_ms else 0
+            } for c in cache_breakdown]
+        })
+        
+    except Exception as e:
+        print(f"❌ Dashboard error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "message": str(e)})
+
+@app.route("/dashboard-view")
+def dashboard_view():
+    """Dashboard HTML page"""
+    if not session.get('user_id'):
+        return redirect('/')
+    return render_template("dashboard.html")
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()

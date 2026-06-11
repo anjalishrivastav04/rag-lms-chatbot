@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>RAG Dashboard</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+    }
+
+    /* HEADER */
+    .header {
+      background: linear-gradient(135deg, #1e40af, #1e3a8a);
+      padding: 16px 32px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+    }
+
+    .header h1 { font-size: 20px; font-weight: 600; color: white; }
+    .header-right { display: flex; align-items: center; gap: 12px; }
+
+    .back-btn {
+      background: rgba(255,255,255,0.1);
+      color: white;
+      border: 1px solid rgba(255,255,255,0.2);
+      padding: 8px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 13px;
+      text-decoration: none;
+      transition: background 0.2s;
+    }
+
+    .back-btn:hover { background: rgba(255,255,255,0.2); }
+
+    .refresh-btn {
+      background: #1e40af;
+      color: white;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 13px;
+      transition: opacity 0.2s;
+    }
+
+    .refresh-btn:hover { opacity: 0.85; }
+
+    /* MAIN CONTENT */
+    .container { padding: 24px 32px; max-width: 1400px; margin: 0 auto; }
+
+    /* STATS CARDS */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .stat-card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 20px;
+      text-align: center;
+      transition: transform 0.2s;
+    }
+
+    .stat-card:hover { transform: translateY(-2px); }
+
+    .stat-icon { font-size: 28px; margin-bottom: 8px; }
+
+    .stat-value {
+      font-size: 32px;
+      font-weight: 700;
+      color: white;
+      margin-bottom: 4px;
+    }
+
+    .stat-label { font-size: 13px; color: #94a3b8; }
+
+    .stat-card.blue { border-top: 3px solid #3b82f6; }
+    .stat-card.green { border-top: 3px solid #22c55e; }
+    .stat-card.amber { border-top: 3px solid #f59e0b; }
+    .stat-card.purple { border-top: 3px solid #a855f7; }
+
+    /* CHARTS ROW */
+    .charts-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .chart-card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 20px;
+    }
+
+    .chart-card h3 {
+      font-size: 15px;
+      font-weight: 600;
+      color: #e2e8f0;
+      margin-bottom: 16px;
+    }
+
+    .chart-container { position: relative; height: 200px; }
+
+    /* FILTERS */
+    .filters {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 16px 20px;
+      margin-bottom: 16px;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .filters label { font-size: 13px; color: #94a3b8; }
+
+    .filters select, .filters input {
+      background: #0f172a;
+      color: #e2e8f0;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    .filters select:focus, .filters input:focus {
+      outline: none;
+      border-color: #3b82f6;
+    }
+
+    .filter-btn {
+      background: #1e40af;
+      color: white;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+
+    .clear-btn {
+      background: #334155;
+      color: #e2e8f0;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+
+    /* TABLE */
+    .table-card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .table-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid #334155;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .table-header h3 { font-size: 15px; font-weight: 600; }
+    .table-count { font-size: 13px; color: #94a3b8; }
+
+    .table-wrapper { overflow-x: auto; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    thead {
+      background: #0f172a;
+    }
+
+    th {
+      padding: 12px 16px;
+      text-align: left;
+      font-size: 12px;
+      font-weight: 600;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      white-space: nowrap;
+    }
+
+    td {
+      padding: 12px 16px;
+      font-size: 13px;
+      border-bottom: 1px solid #1e293b;
+      vertical-align: top;
+    }
+
+    tr:hover td { background: #1e3a5f; }
+
+    .text-truncate {
+      max-width: 200px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      cursor: pointer;
+    }
+
+    .text-truncate:hover { color: #60a5fa; }
+
+    /* CACHE BADGES */
+    .badge {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .badge-redis { background: #7c3aed22; color: #a78bfa; border: 1px solid #7c3aed44; }
+    .badge-semantic { background: #0891b222; color: #67e8f9; border: 1px solid #0891b244; }
+    .badge-none { background: #64748b22; color: #94a3b8; border: 1px solid #64748b44; }
+    .badge-full { background: #dc262622; color: #fca5a5; border: 1px solid #dc262644; }
+
+    /* SCORE STARS */
+    .stars { color: #f59e0b; font-size: 14px; }
+    .score-null { color: #475569; font-size: 12px; }
+
+    /* EXPAND ROW */
+    .expand-row td {
+      background: #0f172a;
+      padding: 16px;
+    }
+
+    .expand-content {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    .expand-section h4 {
+      font-size: 12px;
+      color: #64748b;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+
+    .expand-section p {
+      font-size: 13px;
+      color: #cbd5e1;
+      line-height: 1.6;
+      white-space: pre-wrap;
+    }
+
+    /* LOADING */
+    .loading {
+      text-align: center;
+      padding: 60px;
+      color: #64748b;
+    }
+
+    .loading-spinner {
+      width: 40px;
+      height: 40px;
+      border: 3px solid #334155;
+      border-top-color: #3b82f6;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin: 0 auto 16px;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* MODAL */
+    .modal {
+      display: none;
+      position: fixed;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      background: rgba(0,0,0,0.7);
+      z-index: 9999;
+      justify-content: center;
+      align-items: center;
+    }
+
+    .modal.active { display: flex; }
+
+    .modal-box {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 16px;
+      padding: 28px;
+      width: 90%;
+      max-width: 700px;
+      max-height: 80vh;
+      overflow-y: auto;
+    }
+
+    .modal-box h3 {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 16px;
+      color: #60a5fa;
+    }
+
+    .modal-box p {
+      font-size: 14px;
+      color: #cbd5e1;
+      line-height: 1.7;
+      white-space: pre-wrap;
+    }
+
+    .modal-close {
+      background: #334155;
+      color: white;
+      border: none;
+      padding: 8px 20px;
+      border-radius: 8px;
+      cursor: pointer;
+      margin-top: 16px;
+      font-size: 13px;
+    }
+
+    /* RESPONSIVE */
+    @media (max-width: 768px) {
+      .stats-grid { grid-template-columns: repeat(2, 1fr); }
+      .charts-grid { grid-template-columns: 1fr; }
+      .container { padding: 16px; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- HEADER -->
+  <div class="header">
+    <h1>📊 RAG Evaluation Dashboard</h1>
+    <div class="header-right">
+      <span id="lastUpdated" style="font-size:12px; color:#94a3b8;"></span>
+      <button class="refresh-btn" onclick="loadDashboard()">🔄 Refresh</button>
+      <a href="/" class="back-btn">← Back to Chat</a>
+    </div>
+  </div>
+
+  <!-- MAIN CONTAINER -->
+  <div class="container">
+
+    <!-- LOADING STATE -->
+    <div id="loadingState" class="loading">
+      <div class="loading-spinner"></div>
+      <p>Loading dashboard data...</p>
+    </div>
+
+    <!-- DASHBOARD CONTENT (hidden until loaded) -->
+    <div id="dashboardContent" style="display:none;">
+
+      <!-- STATS CARDS -->
+      <div class="stats-grid">
+        <div class="stat-card blue">
+          <div class="stat-icon">💬</div>
+          <div class="stat-value" id="totalQueries">0</div>
+          <div class="stat-label">Total Queries</div>
+        </div>
+        <div class="stat-card green">
+          <div class="stat-icon">⭐</div>
+          <div class="stat-value" id="avgScore">0</div>
+          <div class="stat-label">Avg Score (out of 5)</div>
+        </div>
+        <div class="stat-card amber">
+          <div class="stat-icon">⚡</div>
+          <div class="stat-value" id="cacheHitRate">0%</div>
+          <div class="stat-label">Cache Hit Rate</div>
+        </div>
+        <div class="stat-card purple">
+          <div class="stat-icon">🚀</div>
+          <div class="stat-value" id="cacheHits">0</div>
+          <div class="stat-label">Total Cache Hits</div>
+        </div>
+      </div>
+
+      <!-- CHARTS -->
+      <div class="charts-grid">
+        <div class="chart-card">
+          <h3>📊 Cache Source Distribution</h3>
+          <div class="chart-container">
+            <canvas id="cacheChart"></canvas>
+          </div>
+        </div>
+        <div class="chart-card">
+          <h3>⭐ Score Distribution</h3>
+          <div class="chart-container">
+            <canvas id="scoreChart"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- FILTERS -->
+      <div class="filters">
+        <label>Filter by:</label>
+
+        <select id="filterCache">
+          <option value="">All Cache Sources</option>
+          <option value="NONE">NONE (Full Pipeline)</option>
+          <option value="REDIS_EXACT">REDIS_EXACT</option>
+          <option value="SEMANTIC_CACHE">SEMANTIC_CACHE</option>
+        </select>
+
+        <select id="filterScore">
+          <option value="">All Scores</option>
+          <option value="5">⭐⭐⭐⭐⭐ Score 5</option>
+          <option value="4">⭐⭐⭐⭐ Score 4</option>
+          <option value="3">⭐⭐⭐ Score 3</option>
+          <option value="2">⭐⭐ Score 2</option>
+          <option value="1">⭐ Score 1</option>
+        </select>
+
+        <select id="filterUser">
+          <option value="">All Users</option>
+        </select>
+
+        <input type="text" id="filterSearch" placeholder="🔍 Search question..." style="min-width:200px;">
+
+        <button class="filter-btn" onclick="applyFilters()">Apply</button>
+        <button class="clear-btn" onclick="clearFilters()">Clear</button>
+      </div>
+
+      <!-- DATA TABLE -->
+      <div class="table-card">
+        <div class="table-header">
+          <h3>📋 Query & Response Log</h3>
+          <span class="table-count" id="tableCount">0 records</span>
+        </div>
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>User</th>
+                <th>Question</th>
+                <th>Answer</th>
+                <th>Cache Source</th>
+                <th>Response Time</th>
+                <th>Score</th>
+                <th>Feedback</th>
+                <th>Time</th>
+              </tr>
+            </thead>
+            <tbody id="tableBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- MODAL for full text -->
+  <div class="modal" id="textModal">
+    <div class="modal-box">
+      <h3 id="modalTitle">Full Text</h3>
+      <p id="modalContent"></p>
+      <button class="modal-close" onclick="closeModal()">Close</button>
+    </div>
+  </div>
+
+  <script>
+    let allData = [];
+    let cacheChart = null;
+    let scoreChart = null;
+
+    // Load dashboard on page load
+    window.addEventListener('load', loadDashboard);
+
+    async function loadDashboard() {
+      document.getElementById('loadingState').style.display = 'block';
+      document.getElementById('dashboardContent').style.display = 'none';
+
+      try {
+        const response = await fetch('/dashboard');
+        const data = await response.json();
+
+        if (!data.success) {
+          alert('❌ ' + data.message);
+          return;
+        }
+
+        allData = data.data;
+
+        // Update stats
+        document.getElementById('totalQueries').textContent = data.stats.total_queries || 0;
+        document.getElementById('avgScore').textContent = data.stats.avg_score ? data.stats.avg_score.toFixed(1) : 'N/A';
+        document.getElementById('cacheHitRate').textContent = (data.stats.cache_hit_rate || 0) + '%';
+        document.getElementById('cacheHits').textContent = data.stats.cache_hits || 0;
+
+        // Update last updated
+        document.getElementById('lastUpdated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+
+        // Populate user filter
+        const users = [...new Set(allData.map(d => d.username))];
+        const userSelect = document.getElementById('filterUser');
+        userSelect.innerHTML = '<option value="">All Users</option>';
+        users.forEach(u => {
+          userSelect.innerHTML += `<option value="${u}">${u}</option>`;
+        });
+
+        // Draw charts
+        drawCacheChart(data.cache_breakdown);
+        drawScoreChart(allData);
+
+        // Render table
+        renderTable(allData);
+
+        // Show content
+        document.getElementById('loadingState').style.display = 'none';
+        document.getElementById('dashboardContent').style.display = 'block';
+
+      } catch (error) {
+        document.getElementById('loadingState').innerHTML = `<p style="color:#ef4444;">❌ Error loading dashboard: ${error.message}</p>`;
+      }
+    }
+
+    function drawCacheChart(breakdown) {
+      const ctx = document.getElementById('cacheChart').getContext('2d');
+
+      if (cacheChart) cacheChart.destroy();
+
+      const labels = breakdown.map(b => b.cache_source || 'NONE');
+      const counts = breakdown.map(b => b.count);
+      const colors = labels.map(l => {
+        if (l.includes('REDIS')) return '#a78bfa';
+        if (l.includes('SEMANTIC')) return '#67e8f9';
+        if (l === 'NONE') return '#64748b';
+        return '#60a5fa';
+      });
+
+      cacheChart = new Chart(ctx, {
+        type: 'doughnut',
+        data: {
+          labels,
+          datasets: [{
+            data: counts,
+            backgroundColor: colors,
+            borderWidth: 0
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: {
+              position: 'bottom',
+              labels: { color: '#94a3b8', font: { size: 11 }, padding: 10 }
+            }
+          }
+        }
+      });
+    }
+
+    function drawScoreChart(data) {
+      const ctx = document.getElementById('scoreChart').getContext('2d');
+
+      if (scoreChart) scoreChart.destroy();
+
+      // Count scores 1-5
+      const scoreCounts = [0, 0, 0, 0, 0];
+      data.forEach(d => {
+        if (d.score >= 1 && d.score <= 5) {
+          scoreCounts[d.score - 1]++;
+        }
+      });
+
+      scoreChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: ['⭐ 1', '⭐⭐ 2', '⭐⭐⭐ 3', '⭐⭐⭐⭐ 4', '⭐⭐⭐⭐⭐ 5'],
+          datasets: [{
+            data: scoreCounts,
+            backgroundColor: ['#ef4444', '#f97316', '#f59e0b', '#22c55e', '#3b82f6'],
+            borderRadius: 6,
+            borderWidth: 0
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { ticks: { color: '#94a3b8', font: { size: 11 } }, grid: { color: '#1e293b' } },
+            y: { ticks: { color: '#94a3b8', font: { size: 11 } }, grid: { color: '#334155' } }
+          }
+        }
+      });
+    }
+
+    function renderTable(data) {
+      const tbody = document.getElementById('tableBody');
+      document.getElementById('tableCount').textContent = data.length + ' records';
+
+      if (data.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; color:#64748b; padding:40px;">No data found</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = data.map((row, i) => `
+        <tr onclick="toggleExpand(${i})" style="cursor:pointer;">
+          <td style="color:#64748b;">${i + 1}</td>
+          <td>
+            <span style="background:#1e40af22; color:#60a5fa; padding:3px 8px; border-radius:20px; font-size:12px;">
+              👤 ${row.username || 'Unknown'}
+            </span>
+          </td>
+          <td>
+            <div class="text-truncate" title="${escapeHtml(row.question || '')}">${escapeHtml(row.question || 'N/A')}</div>
+          </td>
+          <td>
+            <div class="text-truncate" onclick="showModal('Answer', '${escapeHtml(row.answer || '')}'); event.stopPropagation();" title="Click to view full answer">
+              ${escapeHtml((row.answer || 'N/A').substring(0, 80))}${row.answer && row.answer.length > 80 ? '...' : ''}
+            </div>
+          </td>
+          <td>${getCacheBadge(row.cache_source)}</td>
+          <td>
+            <span style="color:${getSpeedColor(row.response_time_ms)};">
+              ${row.response_time_ms ? row.response_time_ms + 'ms' : 'N/A'}
+            </span>
+          </td>
+          <td>${getStars(row.score)}</td>
+          <td>
+            <div class="text-truncate" style="max-width:150px; color:#94a3b8;">
+              ${row.feedback || '<span style="color:#475569">Not evaluated</span>'}
+            </div>
+          </td>
+          <td style="color:#64748b; font-size:12px;">
+            ${row.created_at ? new Date(row.created_at).toLocaleString() : 'N/A'}
+          </td>
+        </tr>
+        <tr id="expand-${i}" style="display:none;" class="expand-row">
+          <td colspan="9">
+            <div class="expand-content">
+              <div class="expand-section">
+                <h4>Full Question</h4>
+                <p>${escapeHtml(row.question || 'N/A')}</p>
+              </div>
+              <div class="expand-section">
+                <h4>Full Answer</h4>
+                <p>${escapeHtml(row.answer || 'N/A')}</p>
+              </div>
+              <div class="expand-section">
+                <h4>Evaluation Feedback</h4>
+                <p>${escapeHtml(row.feedback || 'Not evaluated yet')}</p>
+              </div>
+              <div class="expand-section">
+                <h4>Performance Details</h4>
+                <p>Cache: ${row.cache_source || 'N/A'}
+Response time: ${row.response_time_ms || 'N/A'}ms
+Score: ${row.score ? row.score + '/5' : 'Not scored'}
+Time: ${row.created_at ? new Date(row.created_at).toLocaleString() : 'N/A'}</p>
+              </div>
+            </div>
+          </td>
+        </tr>
+      `).join('');
+    }
+
+    function toggleExpand(i) {
+      const row = document.getElementById(`expand-${i}`);
+      row.style.display = row.style.display === 'none' ? 'table-row' : 'none';
+    }
+
+    function getCacheBadge(source) {
+      if (!source || source === 'NONE') return '<span class="badge badge-none">⚙️ Full Pipeline</span>';
+      if (source.includes('REDIS')) return '<span class="badge badge-redis">⚡ Redis</span>';
+      if (source.includes('SEMANTIC')) return '<span class="badge badge-semantic">🧠 Semantic</span>';
+      return `<span class="badge badge-none">${source}</span>`;
+    }
+
+    function getStars(score) {
+      if (!score) return '<span class="score-null">Not rated</span>';
+      return '<span class="stars">' + '⭐'.repeat(score) + '</span>' +
+             `<span style="color:#64748b; font-size:11px; margin-left:4px;">${score}/5</span>`;
+    }
+
+    function getSpeedColor(ms) {
+      if (!ms) return '#64748b';
+      if (ms < 100) return '#22c55e';
+      if (ms < 1000) return '#f59e0b';
+      return '#ef4444';
+    }
+
+    function applyFilters() {
+      const cacheFilter = document.getElementById('filterCache').value;
+      const scoreFilter = document.getElementById('filterScore').value;
+      const userFilter = document.getElementById('filterUser').value;
+      const searchFilter = document.getElementById('filterSearch').value.toLowerCase();
+
+      let filtered = allData.filter(row => {
+        if (cacheFilter && !(row.cache_source || '').includes(cacheFilter)) return false;
+        if (scoreFilter && row.score != scoreFilter) return false;
+        if (userFilter && row.username !== userFilter) return false;
+        if (searchFilter && !(row.question || '').toLowerCase().includes(searchFilter)) return false;
+        return true;
+      });
+
+      renderTable(filtered);
+      drawScoreChart(filtered);
+    }
+
+    function clearFilters() {
+      document.getElementById('filterCache').value = '';
+      document.getElementById('filterScore').value = '';
+      document.getElementById('filterUser').value = '';
+      document.getElementById('filterSearch').value = '';
+      renderTable(allData);
+      drawScoreChart(allData);
+    }
+
+    function showModal(title, content) {
+      document.getElementById('modalTitle').textContent = title;
+      document.getElementById('modalContent').textContent = content;
+      document.getElementById('textModal').classList.add('active');
+    }
+
+    function closeModal() {
+      document.getElementById('textModal').classList.remove('active');
+    }
+
+    function escapeHtml(text) {
+      if (!text) return '';
+      return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
+    // Close modal on outside click
+    document.getElementById('textModal').addEventListener('click', function(e) {
+      if (e.target === this) closeModal();
+    });
+  </script>
+</body>
+</html>
