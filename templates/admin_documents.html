@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Admin - Document Management</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+    }
+
+    /* HEADER */
+    .header {
+      background: linear-gradient(135deg, #1e40af, #1e3a8a);
+      padding: 16px 32px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+    }
+
+    .header-left { display: flex; align-items: center; gap: 12px; }
+    .header h1 { font-size: 20px; font-weight: 600; color: white; }
+
+    .header-right { display: flex; align-items: center; gap: 10px; }
+
+    .hdr-btn {
+      padding: 8px 16px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      transition: all 0.2s;
+      text-decoration: none;
+    }
+
+    .btn-back {
+      background: rgba(255,255,255,0.1);
+      color: white;
+      border: 1px solid rgba(255,255,255,0.2);
+    }
+
+    .btn-back:hover { background: rgba(255,255,255,0.2); }
+
+    .btn-refresh {
+      background: #1e40af;
+      color: white;
+    }
+
+    .btn-refresh:hover { opacity: 0.85; }
+
+    .btn-dashboard {
+      background: #7c3aed;
+      color: white;
+    }
+
+    .btn-dashboard:hover { opacity: 0.85; }
+
+    /* CONTAINER */
+    .container { padding: 24px 32px; max-width: 1400px; margin: 0 auto; }
+
+    /* STATS CARDS */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .stat-card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 24px;
+      text-align: center;
+      transition: transform 0.2s;
+    }
+
+    .stat-card:hover { transform: translateY(-2px); }
+    .stat-card.blue { border-top: 3px solid #3b82f6; }
+    .stat-card.green { border-top: 3px solid #22c55e; }
+    .stat-card.purple { border-top: 3px solid #a855f7; }
+
+    .stat-icon { font-size: 32px; margin-bottom: 10px; }
+    .stat-value { font-size: 36px; font-weight: 700; color: white; margin-bottom: 6px; }
+    .stat-label { font-size: 14px; color: #94a3b8; }
+
+    /* FILTERS */
+    .filters {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 16px 20px;
+      margin-bottom: 16px;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .filters label { font-size: 13px; color: #94a3b8; }
+
+    .filters select, .filters input {
+      background: #0f172a;
+      color: #e2e8f0;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 13px;
+    }
+
+    .filters select:focus, .filters input:focus {
+      outline: none;
+      border-color: #3b82f6;
+    }
+
+    .filter-btn {
+      background: #1e40af;
+      color: white;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+
+    .clear-btn {
+      background: #334155;
+      color: #e2e8f0;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+
+    /* TABLE */
+    .table-card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .table-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid #334155;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .table-header h3 { font-size: 15px; font-weight: 600; }
+    .table-count { font-size: 13px; color: #94a3b8; }
+
+    .table-wrapper { overflow-x: auto; }
+
+    table { width: 100%; border-collapse: collapse; }
+
+    thead { background: #0f172a; }
+
+    th {
+      padding: 12px 16px;
+      text-align: left;
+      font-size: 12px;
+      font-weight: 600;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      white-space: nowrap;
+    }
+
+    td {
+      padding: 14px 16px;
+      font-size: 13px;
+      border-bottom: 1px solid #1e293b;
+      vertical-align: middle;
+    }
+
+    tr:hover td { background: #1e3a5f; }
+
+    /* FILE TYPE BADGE */
+    .file-badge {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+    }
+
+    .badge-pdf { background: #dc262622; color: #fca5a5; border: 1px solid #dc262644; }
+    .badge-txt { background: #0891b222; color: #67e8f9; border: 1px solid #0891b244; }
+    .badge-jpg, .badge-jpeg, .badge-png, .badge-bmp, .badge-gif {
+      background: #7c3aed22; color: #c4b5fd; border: 1px solid #7c3aed44;
+    }
+    .badge-default { background: #64748b22; color: #94a3b8; border: 1px solid #64748b44; }
+
+    /* FILE NAME */
+    .file-name {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .file-icon { font-size: 20px; }
+
+    .file-info { display: flex; flex-direction: column; gap: 2px; }
+
+    .file-title {
+      font-weight: 600;
+      color: #e2e8f0;
+      font-size: 14px;
+    }
+
+    .file-hash {
+      font-size: 11px;
+      color: #475569;
+      font-family: monospace;
+    }
+
+    /* USER BADGE */
+    .user-badge {
+      background: #1e40af22;
+      color: #60a5fa;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-size: 12px;
+      border: 1px solid #1e40af44;
+    }
+
+    /* SIZE */
+    .size-text { color: #94a3b8; font-size: 13px; }
+
+    /* CHUNKS */
+    .chunks-badge {
+      background: #0f766e22;
+      color: #5eead4;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      border: 1px solid #0f766e44;
+    }
+
+    /* VERSION */
+    .version-badge {
+      background: #78350f22;
+      color: #fbbf24;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 11px;
+      border: 1px solid #78350f44;
+    }
+
+    /* DELETE BUTTON */
+    .delete-btn {
+      background: #fee2e2;
+      color: #991b1b;
+      border: 1px solid #fecaca;
+      padding: 6px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 500;
+      transition: all 0.2s;
+    }
+
+    .delete-btn:hover {
+      background: #fecaca;
+      border-color: #dc2626;
+    }
+
+    /* LOADING */
+    .loading {
+      text-align: center;
+      padding: 60px;
+      color: #64748b;
+    }
+
+    .loading-spinner {
+      width: 40px;
+      height: 40px;
+      border: 3px solid #334155;
+      border-top-color: #3b82f6;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin: 0 auto 16px;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* EMPTY STATE */
+    .empty-state {
+      text-align: center;
+      padding: 60px;
+      color: #64748b;
+    }
+
+    .empty-state .empty-icon { font-size: 48px; margin-bottom: 16px; }
+    .empty-state h3 { font-size: 18px; margin-bottom: 8px; color: #94a3b8; }
+    .empty-state p { font-size: 14px; }
+
+    /* TOAST */
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 14px 20px;
+      font-size: 14px;
+      z-index: 9999;
+      display: none;
+      animation: slideIn 0.3s ease;
+    }
+
+    .toast.success { border-left: 4px solid #22c55e; }
+    .toast.error { border-left: 4px solid #ef4444; }
+
+    @keyframes slideIn {
+      from { transform: translateX(100px); opacity: 0; }
+      to { transform: translateX(0); opacity: 1; }
+    }
+
+    /* RESPONSIVE */
+    @media (max-width: 768px) {
+      .stats-grid { grid-template-columns: 1fr; }
+      .container { padding: 16px; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- HEADER -->
+  <div class="header">
+    <div class="header-left">
+      <h1>📁 Admin — Document Management</h1>
+    </div>
+    <div class="header-right">
+      <span id="lastUpdated" style="font-size:12px; color:#94a3b8;"></span>
+      <button class="hdr-btn btn-refresh" onclick="loadDocuments()">🔄 Refresh</button>
+      <button class="hdr-btn btn-dashboard" onclick="window.open('/admin-dashboard', '_blank')">📊 Dashboard</button>
+      <a href="/" class="hdr-btn btn-back">← Back to Chat</a>
+    </div>
+  </div>
+
+  <!-- MAIN -->
+  <div class="container">
+
+    <!-- LOADING -->
+    <div id="loadingState" class="loading">
+      <div class="loading-spinner"></div>
+      <p>Loading documents...</p>
+    </div>
+
+    <!-- CONTENT -->
+    <div id="mainContent" style="display:none;">
+
+      <!-- STATS -->
+      <div class="stats-grid">
+        <div class="stat-card blue">
+          <div class="stat-icon">📄</div>
+          <div class="stat-value" id="totalFiles">0</div>
+          <div class="stat-label">Total Documents</div>
+        </div>
+        <div class="stat-card green">
+          <div class="stat-icon">💾</div>
+          <div class="stat-value" id="totalSize">0 MB</div>
+          <div class="stat-label">Total Size</div>
+        </div>
+        <div class="stat-card purple">
+          <div class="stat-icon">🧩</div>
+          <div class="stat-value" id="totalChunks">0</div>
+          <div class="stat-label">Total Chunks (RAG Index)</div>
+        </div>
+      </div>
+
+      <!-- FILTERS -->
+      <div class="filters">
+        <label>Filter by:</label>
+
+        <select id="filterType">
+          <option value="">All File Types</option>
+          <option value="PDF">📕 PDF</option>
+          <option value="TXT">📄 TXT</option>
+          <option value="JPG">🖼️ JPG</option>
+          <option value="PNG">🖼️ PNG</option>
+        </select>
+
+        <select id="filterUser">
+          <option value="">All Users</option>
+        </select>
+
+        <input type="text" id="filterSearch" placeholder="🔍 Search filename..." style="min-width:200px;">
+
+        <button class="filter-btn" onclick="applyFilters()">Apply</button>
+        <button class="clear-btn" onclick="clearFilters()">Clear</button>
+      </div>
+
+      <!-- TABLE -->
+      <div class="table-card">
+        <div class="table-header">
+          <h3>📋 All Uploaded Documents</h3>
+          <span class="table-count" id="tableCount">0 files</span>
+        </div>
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>File ID</th>
+                <th>File Name</th>
+                <th>Type</th>
+                <th>Uploaded By</th>
+                <th>Size</th>
+                <th>Chunks</th>
+                <th>Version</th>
+                <th>Upload Date</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="tableBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- TOAST -->
+  <div class="toast" id="toast"></div>
+
+  <script>
+    let allFiles = [];
+
+    window.addEventListener('load', loadDocuments);
+
+    async function loadDocuments() {
+      document.getElementById('loadingState').style.display = 'block';
+      document.getElementById('mainContent').style.display = 'none';
+
+      try {
+        const response = await fetch('/admin/documents');
+        const data = await response.json();
+
+        if (!data.success) {
+          document.getElementById('loadingState').innerHTML = 
+            `<p style="color:#ef4444;">❌ ${data.message}</p>`;
+          return;
+        }
+
+        allFiles = data.files;
+
+        // Update stats
+        document.getElementById('totalFiles').textContent = data.stats.total_files;
+        document.getElementById('totalSize').textContent = data.stats.total_size;
+        document.getElementById('totalChunks').textContent = data.stats.total_chunks;
+
+        // Update last updated
+        document.getElementById('lastUpdated').textContent = 
+          'Last updated: ' + new Date().toLocaleTimeString();
+
+        // Populate user filter
+        const users = [...new Set(allFiles.map(f => f.username))];
+        const userSelect = document.getElementById('filterUser');
+        userSelect.innerHTML = '<option value="">All Users</option>';
+        users.forEach(u => {
+          userSelect.innerHTML += `<option value="${u}">${u}</option>`;
+        });
+
+        // Render table
+        renderTable(allFiles);
+
+        document.getElementById('loadingState').style.display = 'none';
+        document.getElementById('mainContent').style.display = 'block';
+
+      } catch (error) {
+        document.getElementById('loadingState').innerHTML = 
+          `<p style="color:#ef4444;">❌ Error: ${error.message}</p>`;
+      }
+    }
+
+    function renderTable(files) {
+      const tbody = document.getElementById('tableBody');
+      document.getElementById('tableCount').textContent = files.length + ' files';
+
+      if (files.length === 0) {
+        tbody.innerHTML = `
+          <tr>
+            <td colspan="10">
+              <div class="empty-state">
+                <div class="empty-icon">📭</div>
+                <h3>No documents found</h3>
+                <p>Upload some documents to get started!</p>
+              </div>
+            </td>
+          </tr>`;
+        return;
+      }
+
+      tbody.innerHTML = files.map((file, i) => `
+        <tr>
+          <td style="color:#64748b;">${i + 1}</td>
+          <td>
+             <span style="font-family:monospace; font-size:11px; color:#7c3aed; background:#7c3aed22; padding:3px 8px; border-radius:6px; border:1px solid #7c3aed44;">
+             ${file.file_id || 'N/A'}
+             </span>
+          </td>
+          <td>
+            <div class="file-name">
+              <span class="file-icon">${getFileIcon(file.file_type)}</span>
+              <div class="file-info">
+                <span class="file-title">${escapeHtml(file.filename)}</span>
+                <span class="file-hash">${file.file_hash ? file.file_hash.substring(0, 16) + '...' : 'N/A'}</span>
+              </div>
+            </div>
+          </td>
+          <td>${getTypeBadge(file.file_type)}</td>
+          <td><span class="user-badge">👤 ${file.username}</span></td>
+          <td><span class="size-text">${file.size_str}</span></td>
+          <td><span class="chunks-badge">${file.chunk_count || 0} chunks</span></td>
+          <td><span class="version-badge">${file.version || 'v1'}</span></td>
+          <td style="color:#64748b; font-size:12px;">
+            ${file.processed_at ? new Date(file.processed_at).toLocaleString() : 'N/A'}
+          </td>
+          <td>
+            <button onclick="deleteFile('${escapeHtml(file.filename)}')" class="delete-btn">
+              🗑️ Delete
+            </button>
+          </td>
+        </tr>
+      `).join('');
+    }
+
+    function getFileIcon(type) {
+      const icons = {
+        'PDF': '📕', 'TXT': '📄',
+        'JPG': '🖼️', 'JPEG': '🖼️',
+        'PNG': '🖼️', 'BMP': '🖼️',
+        'GIF': '🎞️'
+      };
+      return icons[type] || '📄';
+    }
+
+    function getTypeBadge(type) {
+      const cls = `badge-${(type || 'default').toLowerCase()}`;
+      return `<span class="file-badge ${cls}">${type || 'Unknown'}</span>`;
+    }
+
+    function applyFilters() {
+      const typeFilter = document.getElementById('filterType').value;
+      const userFilter = document.getElementById('filterUser').value;
+      const searchFilter = document.getElementById('filterSearch').value.toLowerCase();
+
+      let filtered = allFiles.filter(file => {
+        if (typeFilter && file.file_type !== typeFilter) return false;
+        if (userFilter && file.username !== userFilter) return false;
+        if (searchFilter && !file.filename.toLowerCase().includes(searchFilter)) return false;
+        return true;
+      });
+
+      renderTable(filtered);
+    }
+
+    function clearFilters() {
+      document.getElementById('filterType').value = '';
+      document.getElementById('filterUser').value = '';
+      document.getElementById('filterSearch').value = '';
+      renderTable(allFiles);
+    }
+
+    async function deleteFile(filename) {
+      if (!confirm(`Are you sure you want to delete "${filename}"?\n\nThis will remove it from the RAG system!`)) {
+        return;
+      }
+
+      try {
+        const response = await fetch(`/documents/${encodeURIComponent(filename)}`, {
+          method: 'DELETE'
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+          showToast('✅ ' + data.message, 'success');
+          loadDocuments(); // Reload
+        } else {
+          showToast('❌ ' + data.message, 'error');
+        }
+      } catch (error) {
+        showToast('❌ Error: ' + error.message, 'error');
+      }
+    }
+
+    function showToast(message, type = 'success') {
+      const toast = document.getElementById('toast');
+      toast.textContent = message;
+      toast.className = `toast ${type}`;
+      toast.style.display = 'block';
+      setTimeout(() => { toast.style.display = 'none'; }, 3000);
+    }
+
+    function escapeHtml(text) {
+      if (!text) return '';
+      return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+  </script>
+</body>
+</html>

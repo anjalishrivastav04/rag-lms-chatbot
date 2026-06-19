@@ -461,6 +461,7 @@
                 <th>Response Time</th>
                 <th>Score</th>
                 <th>Feedback</th>
+                <th>ADMIN FEEDBACK</th>
                 <th>Time</th>
               </tr>
             </thead>
@@ -644,9 +645,10 @@
           <td>${getStars(row.score)}</td>
           <td>
             <div class="text-truncate" style="max-width:150px; color:#94a3b8;">
-              ${row.feedback || '<span style="color:#475569">Not evaluated</span>'}
+             ${row.feedback || '<span style="color:#475569">Not evaluated</span>'}
             </div>
           </td>
+          
           <td style="color:#64748b; font-size:12px;">
             ${row.created_at ? new Date(row.created_at).toLocaleString() : 'N/A'}
           </td>
@@ -755,6 +757,154 @@ Time: ${row.created_at ? new Date(row.created_at).toLocaleString() : 'N/A'}</p>
     document.getElementById('textModal').addEventListener('click', function(e) {
       if (e.target === this) closeModal();
     });
+    // --- ADMIN FEEDBACK ---
+let currentFeedbackData = {};
+
+async function submitFeedback(question, answer, type, event) {
+  event.stopPropagation();
+  
+  if (type === 'thumbs_up') {
+    // Direct thumbs up - no modal needed
+    try {
+      const response = await fetch('/admin/feedback', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          question: question,
+          original_answer: answer,
+          feedback_type: 'thumbs_up'
+        })
+      });
+      
+      const data = await response.json();
+      if (data.success) {
+        showNotification('👍 Marked as correct!', 'success');
+      } else {
+        showNotification('❌ ' + data.message, 'error');
+      }
+    } catch (error) {
+      showNotification('❌ Error: ' + error.message, 'error');
+    }
+    
+  } else {
+    // Thumbs down - show modal for correction
+    currentFeedbackData = { question, answer };
+    document.getElementById('feedbackQuestion').textContent = question;
+    document.getElementById('feedbackOriginal').textContent = answer || 'N/A';
+    document.getElementById('correctAnswerInput').value = '';
+    document.getElementById('feedbackModal').classList.add('active');
+  }
+}
+
+async function saveCorrection() {
+  const correctAnswer = document.getElementById('correctAnswerInput').value.trim();
+  
+  if (!correctAnswer) {
+    showNotification('❌ Please provide a correct answer!', 'error');
+    return;
+  }
+  
+  try {
+    const response = await fetch('/admin/feedback', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        question: currentFeedbackData.question,
+        original_answer: currentFeedbackData.answer,
+        feedback_type: 'thumbs_down',
+        correct_answer: correctAnswer
+      })
+    });
+    
+    const data = await response.json();
+    
+    if (data.success) {
+      closeFeedbackModal();
+      showNotification('✅ Correct answer saved to knowledge base!', 'success');
+    } else {
+      showNotification('❌ ' + data.message, 'error');
+    }
+  } catch (error) {
+    showNotification('❌ Error: ' + error.message, 'error');
+  }
+}
+
+function closeFeedbackModal() {
+  document.getElementById('feedbackModal').classList.remove('active');
+  currentFeedbackData = {};
+}
+
+function showNotification(message, type) {
+  // Create notification
+  const notif = document.createElement('div');
+  notif.style.cssText = `
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    background: ${type === 'success' ? '#166534' : '#991b1b'};
+    color: white;
+    padding: 14px 20px;
+    border-radius: 10px;
+    font-size: 14px;
+    z-index: 99999;
+    animation: slideIn 0.3s ease;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  `;
+  notif.textContent = message;
+  document.body.appendChild(notif);
+  
+  setTimeout(() => notif.remove(), 3000);
+}
   </script>
+  <!-- FEEDBACK MODAL -->
+<div class="modal" id="feedbackModal">
+  <div class="modal-box" style="max-width:550px;">
+    <h3>👎 Provide Correct Answer</h3>
+    <p style="color:#94a3b8; font-size:13px; margin-bottom:16px;">
+      The admin-provided answer will be stored in the knowledge base for future queries.
+    </p>
+    
+    <div style="margin-bottom:16px;">
+      <label style="font-size:12px; color:#64748b; text-transform:uppercase; margin-bottom:6px; display:block;">
+        Original Question:
+      </label>
+      <p id="feedbackQuestion" style="background:#0f172a; padding:12px; border-radius:8px; font-size:13px; color:#e2e8f0; border:1px solid #334155;"></p>
+    </div>
+    
+    <div style="margin-bottom:16px;">
+      <label style="font-size:12px; color:#64748b; text-transform:uppercase; margin-bottom:6px; display:block;">
+        Original Answer (Incorrect):
+      </label>
+      <p id="feedbackOriginal" style="background:#0f172a; padding:12px; border-radius:8px; font-size:13px; color:#fca5a5; border:1px solid #334155; max-height:100px; overflow-y:auto;"></p>
+    </div>
+    
+    <div style="margin-bottom:16px;">
+      <label style="font-size:12px; color:#64748b; text-transform:uppercase; margin-bottom:6px; display:block;">
+        ✅ Correct Answer:
+      </label>
+      <textarea 
+        id="correctAnswerInput"
+        placeholder="Type the correct answer here..."
+        style="width:100%; background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:8px; padding:12px; font-size:13px; min-height:120px; resize:vertical; outline:none; font-family:'Segoe UI', sans-serif;"
+        onfocus="this.style.borderColor='#3b82f6'"
+        onblur="this.style.borderColor='#334155'"
+      ></textarea>
+    </div>
+    
+    <div style="display:flex; gap:10px; justify-content:flex-end;">
+      <button 
+        onclick="closeFeedbackModal()"
+        style="padding:10px 20px; background:#334155; color:#e2e8f0; border:none; border-radius:8px; cursor:pointer; font-size:13px;">
+        Cancel
+      </button>
+      <button 
+        onclick="saveCorrection()"
+        style="padding:10px 20px; background:linear-gradient(135deg,#1e40af,#1e3a8a); color:white; border:none; border-radius:8px; cursor:pointer; font-size:13px; font-weight:600;">
+        ✅ Save & Add to Knowledge Base
+      </button>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>

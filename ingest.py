@@ -3,6 +3,7 @@ import re
 import hashlib
 import glob
 import redis
+import uuid
 from dotenv import load_dotenv
 from graph_handler import build_graph_from_chunks, delete_graph_for_file
 
@@ -28,7 +29,7 @@ POPPLER_PATH = r"C:\Users\iaman\OneDrive\Documents\Desktop\poppler-26.02.0\Libra
 redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 
 # --- GROQ LLM ---
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, api_key=os.getenv("GROQ_API_KEY"))
+llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, api_key=os.getenv("GROQ_API_KEY"))
 
 # --- EMBEDDINGS ---
 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
@@ -199,6 +200,18 @@ def ingest_documents():
         filename = os.path.basename(path)
         filename_lower = filename.lower()
         
+        try:
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from app import app as flask_app, ProcessedFile
+            with flask_app.app_context():
+                 record = ProcessedFile.query.filter_by(filename=filename).first()
+                 file_id = record.file_id if record else str(uuid.uuid4())
+        except Exception:
+              file_id = str(uuid.uuid4())
+        print(f"🔑 File ID for {filename}: {file_id}")
+        # ✅ END ADD
+        
         if filename_lower.endswith('_ocr.txt') or filename_lower.endswith('_vision.txt'):
             print(f"⏭️  SKIPPED: {filename} (Temporary derivative file)\n")
             continue
@@ -333,7 +346,8 @@ def ingest_documents():
             chunks = splitter.split_documents(docs)
 
             for i, chunk in enumerate(chunks):
-                chunk.metadata["source"] = filename  
+                chunk.metadata["source"] = filename 
+                chunk.metadata["file_id"] = file_id 
                 chunk.metadata["filetype"] = filename.rsplit('.', 1)[1].lower()
                 chunk.metadata["chunk_index"] = i
                 chunk.metadata["chunking_method"] = method
@@ -342,6 +356,11 @@ def ingest_documents():
             print(f"   ... ADDED: {len(chunks)} chunks\n")
 
             build_graph_from_chunks(chunks, filename)
+
+            # ✅ Save source index to Redis for O(1) deletion later
+            from app import save_source_index
+            chunk_ids = [chunk.metadata.get("chunk_index", i) for i, chunk in enumerate(chunks)]
+            save_source_index(filename, chunk_ids)
             
             # Cache the successful hash state mapping inside Redis
             redis_client.set(f"fastpass_hash:{filename}", file_disk_hash)
