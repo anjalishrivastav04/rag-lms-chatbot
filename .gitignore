@@ -31,4 +31,4 @@ Thumbs.db
 documents/
 
 # Logs
-*.log
+*.log.env
