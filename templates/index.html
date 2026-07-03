@@ -39,7 +39,7 @@
         </div>
         <div class="header-right">
          <span id="userDisplay"></span>
-         <span id="rateLimitDisplay" style="font-size:12px; color:#94a3b8; background:#1e293b; padding:4px 10px; border-radius:20px; border:1px solid #334155;">💬 200 left</span>
+         <span id="rateLimitDisplay" style="font-size:12px; color:#94a3b8; background:#1e293b; padding:4px 10px; border-radius:20px; border:1px solid #334155;">🔢 50,000 tokens left</span>
          <button id="docsBtn" onclick="openDocumentsModal()" class="hdr-btn hdr-btn-docs" style="display:none;">📁 Docs</button>
          <button id="dashboardBtn" onclick="window.open('/admin-dashboard', '_blank')" class="hdr-btn hdr-btn-docs" style="display:none;">📊 Dashboard</button>
          <button id="adminDocsBtn" onclick="window.open('/admin/documents-view', '_blank')" class="hdr-btn hdr-btn-docs" style="display:none;">📁 All Docs</button>
@@ -121,7 +121,20 @@
 
     // ✅ KAFKA: Track polling/lock state (single source of truth — no duplicate functions!)
     let isRequestPending = false;
+    // ============================================================
+    // ✅ CSRF TOKEN HELPER
+    // ============================================================
+    let csrfToken = "";
 
+    async function fetchCsrfToken() {
+      try {
+        const res = await fetch('/csrf-token');
+        const data = await res.json();
+        csrfToken = data.csrf_token;
+      } catch (e) {
+        console.error('CSRF token fetch error:', e);
+      }
+    }
     marked.setOptions({ breaks: true, gfm: true });
 
     // ============================================================
@@ -163,20 +176,21 @@
         const data = await res.json();
         if (data.error) return;
 
-        const remaining = data.messages_remaining;
-        const used = data.messages_used;
+        const remaining = data.tokens_remaining;
+        const used = data.tokens_used;
+        const limit = data.limit || 50000;
         const display = document.getElementById('rateLimitDisplay');
 
         if (!display) return;
 
-        // Change color based on remaining
-        let color = '#94a3b8';      // grey - plenty left
-        if (remaining <= 50) color = '#f59e0b';   // yellow - getting low
-        if (remaining <= 20) color = '#ef4444';   // red - almost done
+        // Change color based on remaining tokens
+        let color = '#94a3b8';
+        if (remaining <= 10000) color = '#f59e0b';   // yellow - getting low
+        if (remaining <= 5000)  color = '#ef4444';   // red - almost done
 
         display.style.color = color;
-        display.innerHTML = `💬 ${remaining} left`;
-        display.title = `${used} used out of 200 messages in this 4-hour session. Resets in ${data.reset_in_str || '4h 0m'}`;
+        display.innerHTML = `🔢 ${remaining.toLocaleString()} tokens left`;
+        display.title = `${used.toLocaleString()} tokens used out of ${limit.toLocaleString()} in this 4-hour session. Resets in ${data.reset_in_str || '4h 0m'}`;
 
       } catch (e) {
         console.error('Rate limit fetch error:', e);
@@ -203,16 +217,18 @@
       try {
         const res = await fetch(`/chat/result/${requestId}`);
         const data = await res.json();
-
         if (data.done) {
           const reply = data.reply;
           const retrieval_info = data.retrieval_info || "";
           const cache_source = data.cache_source || "";
+          const parts = data.parts || null;
+          console.log("DEBUG parts:", parts);
+          console.log("DEBUG parts:", parts);
           const translated = await translateText(reply, targetLang);
-
+// ✅ Store options for HITL display
+          window.pendingOptions = data.options || [];
           document.getElementById("typing-indicator")?.remove();
-          addMessage(reply, "bot", translated, targetLang, true, retrieval_info, cache_source);
-
+          addMessage(reply, "bot", translated, targetLang, true, retrieval_info, cache_source, parts);
           if (targetLang) speakText(translated, targetLang);
 
           unlockInput(); // ✅ critical — re-enable Send/input/mic now that we're done
@@ -233,9 +249,10 @@
     // ✅ CHECK IF USER IS LOGGED IN ON PAGE LOAD
     // ============================================================
     window.addEventListener('load', async () => {
+      await fetchCsrfToken(); // ← ADD THIS LINE
       try {
-        const response = await fetch('/current-user');
-        const data = await response.json();
+          const response = await fetch('/current-user');
+          const data = await response.json();
         
         if (data.success) {
           document.getElementById('authModal').style.display = 'none';
@@ -335,6 +352,7 @@
         
         if (data.success) {
           errorDiv.style.display = 'none';
+          await fetchCsrfToken();
           document.getElementById('authModal').style.display = 'none';
           document.getElementById('chatContainer').style.display = 'block';
           document.getElementById('authForm').reset();
@@ -373,7 +391,10 @@
 
     async function logout() {
       try {
-        await fetch('/logout', { method: 'POST' });
+        await fetch('/logout', { 
+            method: 'POST',
+            headers: { "X-CSRFToken": csrfToken }  // ← ADD THIS
+      });
         location.reload();
       } catch (error) {
         location.reload();
@@ -483,7 +504,7 @@
       }, speed);
     }
  
-    function addMessage(text, sender, translatedText, lang, useTypewriter = false, retrieval_info = "", cache_source = "") {
+    function addMessage(text, sender, translatedText, lang, useTypewriter = false, retrieval_info = "", cache_source = "", parts = null) {
       const box = document.getElementById("messages");
       if (!box) return;
       
@@ -531,6 +552,67 @@
         if (cache_source.includes('KAFKA')) emoji = '📨';
         cacheDiv.textContent = `${emoji} ${cache_source}`;
         contentCol.appendChild(cacheDiv);
+      }
+      // ✅ Escalation UI for low-confidence parts
+      if (sender === 'bot' && Array.isArray(parts) && parts.length > 0) {
+        const lowConfidenceParts = parts.filter(p => p.low_confidence);
+        lowConfidenceParts.forEach((part) => {
+          const escalateBox = document.createElement("div");
+          escalateBox.innerHTML = `
+            <div style="margin-top:8px;padding:10px;border:1px solid #f59e0b;border-radius:8px;background:#fffbeb;">
+              <div style="color:#92400e;font-size:0.9em;margin-bottom:6px;">⚠️ Not confident about: <strong>${part.question}</strong></div>
+              <button class="escalate-btn" style="background:#f59e0b;color:white;border:none;padding:6px 12px;border-radius:6px;cursor:pointer;">Get help from an admin</button>
+              <div class="escalate-form" style="display:none;margin-top:8px;">
+                <input type="email" class="escalate-email" placeholder="Your email address" style="padding:6px;border:1px solid #ccc;border-radius:6px;width:200px;" />
+                <button class="escalate-submit" style="background:#3b82f6;color:white;border:none;padding:6px 12px;border-radius:6px;cursor:pointer;margin-left:6px;">Send to admin</button>
+                <div class="escalate-status" style="margin-top:6px;font-size:0.85em;"></div>
+              </div>
+            </div>
+          `;
+          contentCol.appendChild(escalateBox);
+
+          const btn = escalateBox.querySelector(".escalate-btn");
+          const form = escalateBox.querySelector(".escalate-form");
+          const emailInput = escalateBox.querySelector(".escalate-email");
+          const submitBtn = escalateBox.querySelector(".escalate-submit");
+          const statusDiv = escalateBox.querySelector(".escalate-status");
+
+          btn.onclick = () => {
+            form.style.display = "block";
+            btn.style.display = "none";
+          };
+
+          submitBtn.onclick = async () => {
+            const email = emailInput.value.trim();
+            if (!email || !email.includes('@')) {
+              statusDiv.textContent = "Please enter a valid email.";
+              return;
+            }
+            submitBtn.disabled = true;
+            statusDiv.textContent = "Sending...";
+            try {
+              const res = await fetch("/escalate", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  email: email,
+                  question: part.question,
+                  ai_answer: part.answer
+                })
+              });
+              const result = await res.json();
+              if (result.success) {
+                statusDiv.textContent = "✅ Sent! You'll get an email once an admin replies.";
+              } else {
+                statusDiv.textContent = "❌ " + (result.message || "Something went wrong.");
+                submitBtn.disabled = false;
+              }
+            } catch (e) {
+              statusDiv.textContent = "❌ Failed to send. Please try again.";
+              submitBtn.disabled = false;
+            }
+          };
+        });
       }
  
       if (sender === 'bot') {
@@ -584,6 +666,48 @@
           controls.appendChild(thumbsDown);
         }
         contentCol.appendChild(controls);
+
+        // ✅ HITL: Show clickable follow-up options
+        if (window.pendingOptions && window.pendingOptions.length > 0) {
+          const optionsDiv = document.createElement("div");
+          optionsDiv.style.cssText = `
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 10px;
+          `;
+          window.pendingOptions.forEach(option => {
+            const btn = document.createElement("button");
+            btn.textContent = option;
+            btn.style.cssText = `
+              background: #1e293b;
+              color: #60a5fa;
+              border: 1px solid #334155;
+              padding: 6px 14px;
+              border-radius: 20px;
+              font-size: 12px;
+              cursor: pointer;
+              transition: all 0.2s;
+            `;
+            btn.onmouseover = () => {
+              btn.style.background = '#1e40af';
+              btn.style.color = 'white';
+            };
+            btn.onmouseout = () => {
+              btn.style.background = '#1e293b';
+              btn.style.color = '#60a5fa';
+            };
+            btn.onclick = () => {
+              const numberMatch = option.match(/^(\d+)\.\s/);
+              document.getElementById('userInput').value = numberMatch ? numberMatch[1] : option;
+              optionsDiv.remove();
+              sendMessage();
+            };
+            optionsDiv.appendChild(btn);
+          });
+          contentCol.appendChild(optionsDiv);
+          window.pendingOptions = [];
+        }
       }
       box.appendChild(wrapper);
       box.scrollTop = box.scrollHeight;
@@ -612,7 +736,12 @@
       box.appendChild(thinking);
       box.scrollTop = box.scrollHeight;
       try {
-        const res = await fetch("/upload", { method: "POST", body: formData });
+        const res = await fetch("/upload", { 
+          method: "POST", 
+          headers: { "X-CSRFToken": csrfToken },  // ← ADD THIS (no Content-Type for FormData)
+          body: formData 
+      });
+
         const data = await res.json();
         document.getElementById("upload-indicator")?.remove();
         if (data.success) {
@@ -658,10 +787,13 @@
 
       try {
         const res = await fetch("/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
+            method: "POST",
+            headers: { 
+              "Content-Type": "application/json",
+              "X-CSRFToken": csrfToken           // ← ADD THIS
+          },
           body: JSON.stringify({ message: text, session_id: currentSession })
-        });
+     });
 
         const data = await res.json();
 
@@ -687,18 +819,22 @@
         }
 
         // ✅ If done=true, it was a cache hit - show immediately
+        // ✅ If done=true, it was a cache hit - show immediately
         if (data.done) {
           const reply = data.reply;
           const retrieval_info = data.retrieval_info || "";
           const cache_source = data.cache_source || "";
+          const parts = data.parts || null;
           const translated = await translateText(reply, targetLang);
 
+          // ✅ Store options for HITL display
+          window.pendingOptions = data.options || [];
           document.getElementById("typing-indicator")?.remove();
-          addMessage(reply, "bot", translated, targetLang, true, retrieval_info, cache_source);
+          addMessage(reply, "bot", translated, targetLang, true, retrieval_info, cache_source, parts);
 
           if (targetLang) speakText(translated, targetLang);
 
-          unlockInput(); // ✅ unlock — done synchronously
+          unlockInput();
           return;
         }
 
@@ -830,9 +966,12 @@
         try {
           const response = await fetch('/admin/feedback', {
             method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ question, original_answer: answer, feedback_type: 'thumbs_up' })
-          });
+            headers: {
+               'Content-Type': 'application/json',
+               'X-CSRFToken': csrfToken             // ← ADD THIS
+         },
+           body: JSON.stringify({ question, original_answer: answer, feedback_type: 'thumbs_up' })
+        });
           const data = await response.json();
           if (data.success) {
             btnElement.innerHTML = '✅';
@@ -862,14 +1001,17 @@
       try {
         const response = await fetch('/admin/feedback', {
           method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({
-            question: chatFeedbackData.question,
-            original_answer: chatFeedbackData.answer,
-            feedback_type: 'thumbs_down',
-            correct_answer: correctAnswer
-          })
-        });
+          headers: {
+            'Content-Type': 'application/json',
+            'X-CSRFToken': csrfToken             // ← ADD THIS
+       },
+       body: JSON.stringify({
+         question: chatFeedbackData.question,
+         original_answer: chatFeedbackData.answer,
+         feedback_type: 'thumbs_down',
+         correct_answer: correctAnswer
+      })
+      });
         const data = await response.json();
         if (data.success) {
           closeChatFeedbackModal();
@@ -910,4 +1052,4 @@
     });
   </script>
 </body>
-</html>
+</html> 

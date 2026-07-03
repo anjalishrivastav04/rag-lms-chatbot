@@ -1,0 +1,422 @@
+import re
+import json
+import time
+import logging
+from langchain_community.vectorstores import FAISS
+from langchain_community.retrievers import BM25Retriever
+from langchain_core.documents import Document
+from extensions import db, llm, eval_llm, embeddings, embedder
+from models.models import ProcessedFile
+from services.cache import (
+    check_redis_cache, save_to_redis_cache,
+    check_semantic_cache, save_to_semantic_cache,
+    cache_response_with_ttl, get_blacklist
+)
+from services.vectorstore import dense_retriever, bm25_retriever
+from graph_handler import graph_retrieve
+from config import RRF_K
+
+# ✅ get_answer() is always invoked from worker.py's process_message(), which
+# already calls set_trace_id(request_id) before reaching here. Reusing the
+# "worker" logger means every log line below automatically carries that
+# same trace_id/request_id — no need to pass it through every function.
+logger = logging.getLogger("worker")
+
+# ============================================================
+# --- SAFE LLM INVOKE ---
+# ============================================================
+
+def safe_invoke(llm_instance, prompt, max_retries=2, wait_seconds=20):
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            return llm_instance.invoke(prompt)
+        except Exception as e:
+            last_error = e
+            error_str = str(e)
+            if "rate_limit_exceeded" in error_str or "413" in error_str or "429" in error_str:
+                if attempt < max_retries:
+                    logger.warning("llm_rate_limited_retrying", extra={
+                        "attempt": attempt + 1,
+                        "max_retries": max_retries,
+                        "wait_seconds": wait_seconds,
+                    })
+                    time.sleep(wait_seconds)
+                    continue
+            logger.error("llm_invoke_failed", exc_info=True, extra={"attempt": attempt + 1})
+            raise
+    raise last_error
+
+# ============================================================
+# --- RETRIEVAL ---
+# ============================================================
+
+def reciprocal_rank_fusion(bm25_docs, dense_docs):
+    scores = {}
+    doc_map = {}
+    for rank, doc in enumerate(bm25_docs, start=1):
+        key = doc.page_content
+        scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
+        doc_map[key] = doc
+    for rank, doc in enumerate(dense_docs, start=1):
+        key = doc.page_content
+        scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
+        doc_map[key] = doc
+    ranked_keys = sorted(scores, key=lambda k: scores[k], reverse=True)
+    return [doc_map[k] for k in ranked_keys]
+
+def hybrid_retrieve(question):
+    from services.vectorstore import bm25_retriever, dense_retriever
+    bm25_docs = bm25_retriever.invoke(question)
+    dense_docs = dense_retriever.invoke(question)
+    return reciprocal_rank_fusion(bm25_docs, dense_docs)
+
+def rerank_documents(question, docs, top_n=3):
+    from extensions import reranker
+    from flashrank import RerankRequest
+    if not docs or (len(docs) == 1 and docs[0].metadata.get("source") == "system"):
+        return docs[:top_n]
+    passages = [{"id": i, "text": doc.page_content} for i, doc in enumerate(docs)]
+    rerank_request = RerankRequest(query=question, passages=passages)
+    results = reranker.rerank(rerank_request)
+    top_results = sorted(results, key=lambda x: x["score"], reverse=True)[:top_n]
+    top_indices = [r["id"] for r in top_results]
+    return [docs[i] for i in top_indices]
+
+# ============================================================
+# --- QUERY HELPERS ---
+# ============================================================
+
+def is_casual_query(question):
+    greetings = r"\b(hi|hello|hey|greetings|good morning|good afternoon|good evening|wassup|yo|who are you|what is your name|how are you|what can you do|help|thanks|thank you|okay|ok|cool|nice|great|bye|goodbye|what do you mean|clarify|rephrase)\b"
+    if re.search(greetings, question.lower().strip()):
+        return True
+
+    # ✅ Catch identity/meta questions about the bot itself — these were
+    # previously falling through to decompose_question(), which incorrectly
+    # split a single identity question into fake "parts", leading to broken
+    # replies unrelated to what was actually asked.
+    identity_patterns = r"\b(about yourself|your goals|your purpose|your capabilities|your features|tell me more about you|introduce yourself|what are you)\b"
+    if re.search(identity_patterns, question.lower().strip()):
+        return True
+
+    if re.match(r'^\d+\.?\s*$', question.strip()):
+        return True
+    return False
+
+def is_list_documents_query(question):
+    patterns = r"\b(list|show|what|which).*(document|file|pdf)s?\b"
+    return bool(re.search(patterns, question.lower().strip()))
+
+def decompose_question(question):
+    if is_casual_query(question) or is_list_documents_query(question):
+        return [{"label": question, "question": question}]
+
+    decompose_prompt = f"""Determine if the following user question contains MULTIPLE distinct, separately-answerable parts.
+
+If it has multiple distinct parts, split it into separate sub-questions.
+If it is a single question, return it unchanged as one part.
+
+Reply in this EXACT JSON format only, nothing else, no markdown fences:
+{{"parts": [{{"label": "short 3-5 word label", "question": "full standalone sub-question"}}]}}
+
+QUESTION: {question}
+"""
+    try:
+        response = safe_invoke(eval_llm, decompose_prompt)
+        content = response.content.strip().replace("```json", "").replace("```", "").strip()
+        data = json.loads(content)
+        parts = data.get("parts", [])
+        if isinstance(parts, list) and len(parts) > 1:
+            return [{"label": p["label"], "question": p["question"]} for p in parts if p.get("question")]
+        return [{"label": question, "question": question}]
+    except Exception:
+        logger.warning("question_decomposition_failed", exc_info=True)
+        return [{"label": question, "question": question}]
+
+def generate_followup_options(question, answer):
+    try:
+        options_prompt = f"""A user asked this specific question and got this answer.
+Generate exactly 3 short follow-up questions that are DIRECTLY related to THIS specific question and answer only.
+
+QUESTION: {question}
+ANSWER: {answer[:800]}
+
+Rules:
+- Each option must be under 8 words
+- Must be DIRECTLY about the same topic as the question above
+- Do NOT generate generic questions about unrelated topics
+- Make them feel like a natural next question a curious person would ask
+- Return ONLY a JSON array, nothing else
+- Example for a question about Django: ["How does Django handle migrations?", "What is Django ORM?", "How to deploy Django apps?"]
+
+JSON array:"""
+
+        options_response = eval_llm.invoke(options_prompt)
+        content = options_response.content.strip()
+        content = content.replace("```json", "").replace("```", "").strip()
+        options = json.loads(content)
+        return options[:4] if isinstance(options, list) else []
+    except Exception:
+        logger.warning("options_generation_failed", exc_info=True)
+        return []
+
+def format_multi_part_reply(parts):
+    sections = []
+    for i, part in enumerate(parts, start=1):
+        section = f"**{i}. {part['question']}**\n{part['answer']}"
+        if part['low_confidence']:
+            section += "\n\n⚠️ *I'm not fully confident in this part of the answer — it may be incorrect.*"
+        sections.append(section)
+    return "\n\n".join(sections)
+
+# ============================================================
+# --- DB HELPERS ---
+# ============================================================
+
+def get_past_chat_history(session_id, limit=6):
+    from models.models import ChatHistory
+    try:
+        history = ChatHistory.query.filter_by(session_id=session_id)\
+                                   .order_by(ChatHistory.created_at.desc())\
+                                   .limit(limit).all()
+        history.reverse()
+        formatted = ""
+        for msg in history:
+            label = "Student" if msg.role == "user" else "Assistant"
+            formatted += f"{label}: {msg.content}\n"
+        return formatted if formatted else "No previous history.\n"
+    except Exception:
+        logger.error("chat_history_fetch_failed", exc_info=True, extra={"session_id": session_id})
+        return "No previous history.\n"
+
+def save_chat_message(user_id, session_id, role, content, cache_source='NONE', response_time_ms=0, ip_address=None):
+    from models.models import ChatHistory
+    try:
+        msg = ChatHistory(
+            user_id=user_id,
+            session_id=session_id,
+            role=role,
+            content=content,
+            cache_source=cache_source,
+            response_time_ms=response_time_ms,
+            ip_address=ip_address
+        )
+        db.session.add(msg)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        logger.error("chat_message_save_failed", exc_info=True, extra={
+            "user_id": user_id,
+            "session_id": session_id,
+        })
+
+def ingest_feedback_to_vectorstore(question, correct_answer, feedback_id):
+    from services.vectorstore import vectorstore, ALL_DOCS, dense_retriever, bm25_retriever
+    import services.vectorstore as vs_module
+    try:
+        content = f"Q: {question}\nA: {correct_answer}"
+        doc = Document(
+            page_content=content,
+            metadata={
+                "source": f"admin_feedback_{feedback_id}",
+                "filetype": "feedback",
+                "chunk_index": 0,
+                "question": question,
+                "is_admin_feedback": True
+            }
+        )
+        if vs_module.vectorstore:
+            vs_module.vectorstore.add_documents([doc])
+            vs_module.vectorstore.save_local("vectorstore")
+            vs_module.ALL_DOCS.append(doc)
+            vs_module.bm25_retriever = BM25Retriever.from_documents(vs_module.ALL_DOCS, k=6)
+            cache_response_with_ttl(
+                user_id=1,
+                query_text=question,
+                query_embedding=embedder.encode(question),
+                response=correct_answer,
+                content_type='admin_feedback'
+            )
+            logger.info("feedback_ingested", extra={"feedback_id": feedback_id, "question": question[:50]})
+            return True
+        else:
+            vs_module.vectorstore = FAISS.from_documents([doc], embeddings)
+            vs_module.vectorstore.save_local("vectorstore")
+            vs_module.ALL_DOCS.append(doc)
+            vs_module.bm25_retriever = BM25Retriever.from_documents(vs_module.ALL_DOCS, k=6)
+            logger.info("vectorstore_created_from_feedback", extra={"feedback_id": feedback_id})
+            return True
+    except Exception:
+        logger.error("feedback_ingestion_failed", exc_info=True, extra={"feedback_id": feedback_id})
+        return False
+
+# ============================================================
+# --- MAIN ANSWER FUNCTION ---
+# ============================================================
+
+def get_answer(question, session_id):
+    past_history = get_past_chat_history(session_id, limit=6)
+    blacklist = get_blacklist()
+    blacklist_str = ", ".join(blacklist) if blacklist else "None"
+
+    if is_casual_query(question):
+        logger.info("casual_query_routed", extra={"session_id": session_id})
+        prompt = f"""You are a friendly, warm and enthusiastic document assistant named RagBot! 🤖
+You love helping students and users find information from their documents.
+When someone greets you, respond in a fun, warm and welcoming way.
+Introduce yourself briefly and let them know what you can help with.
+Keep it short, friendly and use emojis naturally.
+Do NOT reference or fabricate any document content in casual conversation.
+Deleted files: {blacklist_str}
+
+### PAST CONVERSATION:
+{past_history}
+
+### QUESTION:
+{question}
+
+Answer:"""
+        response = safe_invoke(llm, prompt)
+        return response.content, "NONE", "⚡ Direct LLM Conversation (No Document Search)", []
+
+    if is_list_documents_query(question):
+        try:
+            blacklist_filenames = set(get_blacklist())
+            files = ProcessedFile.query.all()
+            valid_files = [f for f in files if f.filename not in blacklist_filenames]
+            if not valid_files:
+                return "There are no documents available right now.", "NONE", "📋 Direct database lookup", []
+            file_list = "\n".join([f"- {f.file_id}" for f in valid_files])
+            answer = f"Here are the available documents:\n\n{file_list}"
+            return answer, "NONE", "📋 Direct database lookup (no LLM hallucination)", []
+        except Exception:
+            logger.warning("list_documents_query_failed", exc_info=True)
+
+    cached = check_redis_cache(question)
+    if cached:
+        logger.info("cache_hit", extra={"cache_source": "REDIS", "session_id": session_id})
+        return cached, "REDIS", "", []
+
+    cached = check_semantic_cache(question)
+    if cached:
+        save_to_redis_cache(question, cached)
+        logger.info("cache_hit", extra={"cache_source": "SEMANTIC", "session_id": session_id})
+        return cached, "SEMANTIC", "", []
+
+    retrieval_start = time.time()
+    docs = hybrid_retrieve(question)
+    docs = rerank_documents(question, docs, top_n=6)
+    retrieval_latency_ms = round((time.time() - retrieval_start) * 1000, 2)
+    logger.info("retrieval_completed", extra={
+        "session_id": session_id,
+        "latency_ms": retrieval_latency_ms,
+        "num_docs": len(docs),
+    })
+
+    if blacklist:
+        original_count = len(docs)
+        docs = [
+            doc for doc in docs
+            if not any(
+                bl.lower().rsplit('.', 1)[0] in doc.metadata.get("source", "").lower()
+                for bl in blacklist
+            )
+        ]
+        filtered_count = original_count - len(docs)
+        if filtered_count > 0:
+            logger.info("blacklist_filter_applied", extra={"chunks_removed": filtered_count})
+
+    graph_context, related_entities = graph_retrieve(question)
+    extra_docs = []
+    if related_entities:
+        from services.vectorstore import dense_retriever
+        for entity in related_entities[:5]:
+            entity_docs = dense_retriever.invoke(entity)
+            entity_docs = [
+                d for d in entity_docs
+                if not any(
+                    bl.lower().rsplit('.', 1)[0] in d.metadata.get("source", "").lower()
+                    for bl in blacklist
+                )
+            ]
+            extra_docs.extend(entity_docs)
+        existing_contents = {doc.page_content for doc in docs}
+        MAX_TOTAL_DOCS = 10
+        for doc in extra_docs:
+            if len(docs) >= MAX_TOTAL_DOCS:
+                break
+            if doc.page_content not in existing_contents:
+                docs.append(doc)
+                existing_contents.add(doc.page_content)
+        logger.info("graph_entities_added", extra={
+            "num_entities": len(related_entities[:5]),
+            "total_docs": len(docs),
+        })
+
+    if not docs or (len(docs) == 1 and docs[0].metadata.get("source") == "system"):
+        return "I don't have any uploaded documents to extract information from right now.", "NONE", "", []
+
+    context = ""
+    sources_set = set()
+    for doc in docs:
+        source = doc.metadata.get("source", "unknown")
+        filetype = doc.metadata.get("filetype", "unknown")
+        chunk_index = doc.metadata.get("chunk_index", "?")
+        sources_set.add(source)
+        file_record = ProcessedFile.query.filter_by(filename=source).first()
+        file_id = file_record.file_id if file_record else "UNKNOWN"
+        context += f"[FileID: {file_id} | Type: {filetype} | Chunk: {chunk_index}]\n"
+        context += doc.page_content[:600] + "\n\n"
+
+    alpha = 0.7
+    retrieval_info = f"📊 Retrieved using: {int(alpha*100)}% Semantic (FAISS) + {int((1-alpha)*100)}% Keyword (BM25)\n📎 Sources: {', '.join(sources_set)}"
+
+    prompt = f"""You are an expert, smart, helpful document assistant. Your job is to answer questions based strictly on the provided context.
+
+STRICT RULES — follow these without exception:
+1. Answer in clean, natural, conversational language only.
+2. NEVER display source tags like [Source:...], [Type:...], or [Chunk:...] in your answer.
+3. NEVER reveal actual filenames to the user — always refer to documents by their File ID only.
+4. When asked what files/documents are available, list only File IDs that appear EXACTLY as written in the context below.
+5. If the answer is found in the context, answer confidently and completely.
+6. If multiple documents have relevant info, combine and summarize from ALL of them.
+7. If the answer is NOT in the context, say clearly: "I don't have information about this in the uploaded documents."
+8. NEVER make up or guess information that is not in the context.
+9. If the document mentions a year or date, use that — do NOT use today's date or assume the current year is 2026.
+10. The following files have been DELETED — completely IGNORE any information from them: {blacklist_str}
+11. Keep your answer focused and concise — no unnecessary filler or repetition.
+
+### PAST CONVERSATION:
+{past_history}
+
+### KNOWLEDGE GRAPH:
+{graph_context}
+
+### CONTEXT:
+{context}
+
+### QUESTION:
+{question}
+
+Answer:"""
+
+    llm_start = time.time()
+    response = safe_invoke(llm, prompt)
+    llm_latency_ms = round((time.time() - llm_start) * 1000, 2)
+    answer = response.content
+    logger.info("llm_answer_generated", extra={
+        "session_id": session_id,
+        "latency_ms": llm_latency_ms,
+        "num_sources": len(sources_set),
+    })
+
+    options = generate_followup_options(question, answer)
+
+    if "[Source:" not in answer and "[Type:" not in answer and "[FileID:" not in answer:
+        save_to_redis_cache(question, answer)
+        save_to_semantic_cache(question, answer)
+    else:
+        logger.warning("bad_response_detected_skipping_cache", extra={"session_id": session_id})
+
+    return answer, "NONE", retrieval_info, options

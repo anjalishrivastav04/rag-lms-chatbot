@@ -455,6 +455,7 @@
               <tr>
                 <th>#</th>
                 <th>User</th>
+                <th>IP Address</th>
                 <th>Question</th>
                 <th>Answer</th>
                 <th>Cache Source</th>
@@ -616,7 +617,7 @@
       document.getElementById('tableCount').textContent = data.length + ' records';
 
       if (data.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; color:#64748b; padding:40px;">No data found</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="10" style="text-align:center; color:#64748b; padding:40px;">No data found</td></tr>';
         return;
       }
 
@@ -627,6 +628,9 @@
             <span style="background:#1e40af22; color:#60a5fa; padding:3px 8px; border-radius:20px; font-size:12px;">
               👤 ${row.username || 'Unknown'}
             </span>
+          </td>
+          <td>
+            <span style="font-family:monospace; font-size:12px; color:#94a3b8;">${escapeHtml(row.ip_address || 'N/A')}</span>
           </td>
           <td>
             <div class="text-truncate" title="${escapeHtml(row.question || '')}">${escapeHtml(row.question || 'N/A')}</div>
@@ -654,7 +658,7 @@
           </td>
         </tr>
         <tr id="expand-${i}" style="display:none;" class="expand-row">
-          <td colspan="9">
+          <td colspan="10">
             <div class="expand-content">
               <div class="expand-section">
                 <h4>Full Question</h4>

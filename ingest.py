@@ -1,6 +1,5 @@
 import os
 import re
-import hashlib
 import glob
 import redis
 import uuid
@@ -200,15 +199,9 @@ def ingest_documents():
         filename = os.path.basename(path)
         filename_lower = filename.lower()
         
-        try:
-            import sys
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            from app import app as flask_app, ProcessedFile
-            with flask_app.app_context():
-                 record = ProcessedFile.query.filter_by(filename=filename).first()
-                 file_id = record.file_id if record else str(uuid.uuid4())
-        except Exception:
-              file_id = str(uuid.uuid4())
+        # Look up file_id from Redis (saved during upload)
+        file_id_key = f"file_id:{filename}"
+        file_id = redis_client.get(file_id_key) or str(uuid.uuid4())
         print(f"🔑 File ID for {filename}: {file_id}")
         # ✅ END ADD
         
@@ -220,13 +213,12 @@ def ingest_documents():
         # 🧠 EARLY CACHE CHECK: Stop processing if the file is unchanged
         # -------------------------------------------------------------
         try:
-            with open(path, "rb") as f:
-                raw_bytes = f.read()
-            file_disk_hash = hashlib.md5(raw_bytes).hexdigest()
+            stat = os.stat(path)
+            file_stat_sig = f"{stat.st_mtime_ns}:{stat.st_size}"
             
             is_already_indexed = redis_client.get(f"fastpass_hash:{filename}")
             
-            if is_already_indexed == file_disk_hash:
+            if is_already_indexed == file_stat_sig:
                 print(f"⚡ FAST-PASS: {filename} has not changed. Skipping extraction and vision analysis entirely!\n")
                 continue
         except Exception as hash_err:
@@ -289,11 +281,23 @@ def ingest_documents():
                                             "page": page_num + 1
                                         }
                                     ))
+                                else:
+                                    print(f"⚠️ OCR returned empty text for Page {page_num + 1}. Falling back to original (low-quality) text.")
+                                    doc.metadata["degraded"] = True
+                                    doc.metadata["degraded_reason"] = "ocr_empty"
+                                    docs.append(doc)
                                 
                                 if os.path.exists(temp_img_path):
                                     os.remove(temp_img_path)
+                            else:
+                                print(f"⚠️ No image rendered for Page {page_num + 1}. Falling back to original (low-quality) text.")
+                                doc.metadata["degraded"] = True
+                                doc.metadata["degraded_reason"] = "no_image_rendered"
+                                docs.append(doc)
                         except Exception as pdf_img_err:
                             print(f"⚠️ Image-to-PDF parser skipped Page {page_num + 1}: {pdf_img_err}")
+                            doc.metadata["degraded"] = True
+                            doc.metadata["degraded_reason"] = f"ocr_exception: {pdf_img_err}"
                             docs.append(doc)
 
             # 3. Handle Pure Image Files with Toggle Configuration
@@ -358,12 +362,12 @@ def ingest_documents():
             build_graph_from_chunks(chunks, filename)
 
             # ✅ Save source index to Redis for O(1) deletion later
-            from app import save_source_index
+            from redis_helpers import save_source_index
             chunk_ids = [chunk.metadata.get("chunk_index", i) for i, chunk in enumerate(chunks)]
             save_source_index(filename, chunk_ids)
             
             # Cache the successful hash state mapping inside Redis
-            redis_client.set(f"fastpass_hash:{filename}", file_disk_hash)
+            redis_client.set(f"fastpass_hash:{filename}", file_stat_sig)
             
         except Exception as e:
             print(f"❌ Failed processing {filename}: {str(e)}\n")
@@ -413,8 +417,20 @@ def ingest_documents():
     except ValueError as val_err:
         print(f"⚠️ Index Sync Desynchronization Detected: ({val_err})")
         print("🔄 Performing automatic index reconciliation rebuild...")
+        
+        # Clear record_manager's tracking state so it doesn't reference
+        # chunks/sources that may no longer match the rebuilt FAISS index.
+        try:
+            record_manager.delete_keys(record_manager.list_keys())
+            print("🗑️ Cleared record manager tracking state (was at risk of desync).")
+        except Exception as rm_err:
+            print(f"⚠️ Could not clear record manager cleanly: {rm_err}")
+        
         vectorstore = FAISS.from_documents(all_chunks, embeddings)
-        print("✅ Vector database re-indexed cleanly from active documents.")
+        print("✅ Vector database re-indexed from this run's chunks only.")
+        print("⚠️ NOTE: This was a partial recovery — only chunks processed in this run are indexed.")
+        print("⚠️ Files that were already indexed in prior runs and were NOT re-uploaded this time")
+        print("⚠️ may be MISSING from the new index. Consider re-uploading all documents to be safe.")
 
     vectorstore.save_local(faiss_dir)
     print("✅ Local FAISS index updated successfully!")

@@ -2,9 +2,12 @@ from app import app, db
 
 with app.app_context():
     print("✨ Creating new tables with updated schema...")
-    # DON'T drop old tables, just create new ones
-    db.create_all()  # Only creates missing tables
+    # Only creates missing tables, keeps existing data
+    db.create_all()
     
     print("✅ Database updated successfully!")
-    print("📚 New tables added (existing data preserved):")
-    print("  - semantic_cache ✨ NEW!")
+    print("📚 New table added (existing data preserved):")
+    print("  - users ✅ (existing)")
+    print("  - chat_history ✅ (existing)")
+    print("  - processed_files ✅ (existing)")
+    print("  - semantic_cache ✨ NEW!")         
