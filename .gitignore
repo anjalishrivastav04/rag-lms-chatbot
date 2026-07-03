@@ -32,3 +32,4 @@ documents/
 
 # Logs
 *.log.env
+logs/
