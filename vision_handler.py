@@ -29,7 +29,7 @@ def analyze_image(image_path):
         }
         
         print(f"🤖 Sending request to local LLaVA engine (this may take a few seconds)...")
-        response = requests.post(url, json=payload, timeout=90)
+        response = requests.post(url, json=payload, timeout=300)
         
         if response.status_code == 200:
             description = response.json().get("response", "").strip()

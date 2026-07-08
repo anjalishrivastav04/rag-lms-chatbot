@@ -112,4 +112,4 @@ def current_user():
         logger.warning("session_user_not_found", extra={"user_id": user_id})
         session.clear()
         return jsonify({"success": False, "message": "User not found"})
-    return jsonify({"success": True, "user": user.to_dict()})
+    return jsonify({"success": True, "user": user.to_dict()})   

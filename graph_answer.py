@@ -2,59 +2,43 @@
 graph_answer.py
 ----------------
 LangGraph version of get_answer() from services/rag.py.
-
-This does NOT replace get_answer() yet — it's a standalone module you can
-test independently before deciding whether to wire it into worker.py.
-
-Key difference from your current get_answer(): after evaluate_node scores
-the answer, if confidence is borderline (not terrible, not great), the
-graph loops back to retrieve_node with a reformulated query BEFORE
-escalating to a human. This is the self-correction loop we discussed —
-it re-grounds against fresh retrieval each time rather than just asking
-the LLM to "improve" its own answer blind, which is what keeps this safe
-from compounding hallucination.
-
-Usage (once you're ready to wire it in):
-    from graph_answer import build_graph
-    app = build_graph()
-    result = app.invoke({
-        "question": user_message,
-        "session_id": session_id,
-        "user_id": user_id,
-    })
-    # result["answer"], result["cache_source"], result["retrieval_info"], result["options"]
+Now includes mem0 integration: recalls known facts about the user before
+generating an answer, and saves new facts after the conversation turn.
 """
 
 import logging
+import threading
 from typing import TypedDict, Optional, List
 
 from langgraph.graph import StateGraph, END
 
-# Reuse your actual functions — nothing here is reimplemented, just wrapped.
 from services.rag import (
     is_casual_query,
     is_list_documents_query,
+    is_personal_statement,   # NEW
     hybrid_retrieve,
     rerank_documents,
     safe_invoke,
     generate_followup_options,
     get_past_chat_history,
 )
+
 from services.cache import (
     check_redis_cache, save_to_redis_cache,
     check_semantic_cache, save_to_semantic_cache,
     get_blacklist,
 )
 from services.evaluation import evaluate_response
+from services.memory_service import get_user_memories, save_conversation_turn
 from graph_handler import graph_retrieve
 from extensions import llm
 from models.models import ProcessedFile
 
 logger = logging.getLogger("worker")
 
-MAX_RETRIES = 1  # how many times to self-correct before escalating
-ESCALATE_THRESHOLD = 2  # confidence <= this -> escalate
-RETRY_THRESHOLD = 3     # confidence <= this (but > ESCALATE_THRESHOLD) -> retry once
+MAX_RETRIES = 1
+ESCALATE_THRESHOLD = 2
+RETRY_THRESHOLD = 3
 
 
 class ChatState(TypedDict):
@@ -67,6 +51,7 @@ class ChatState(TypedDict):
     docs: list
     context: str
     retrieval_info: str
+    memory_context: str
     answer: str
     confidence: Optional[float]
     retry_count: int
@@ -86,11 +71,20 @@ def classify_node(state: ChatState) -> dict:
         "question": question[:80],
     })
     return {
-        "is_casual": is_casual_query(question),
+        "is_casual": is_casual_query(question) or is_personal_statement(question),
         "is_list_query": is_list_documents_query(question),
         "original_question": question,
         "retry_count": 0,
     }
+
+
+def recall_memory_node(state: ChatState) -> dict:
+    facts = get_user_memories(state["question"], state["user_id"])
+    logger.info("graph_memory_recalled", extra={
+        "session_id": state["session_id"],
+        "user_id": state["user_id"],
+    })
+    return {"memory_context": facts}
 
 
 def cache_check_node(state: ChatState) -> dict:
@@ -149,12 +143,21 @@ def generate_node(state: ChatState) -> dict:
 
     if state.get("is_casual"):
         prompt = f"""You are RagBot, a friendly document assistant. Respond warmly and briefly.
+
+### WHAT YOU KNOW ABOUT THIS USER:
+{state.get('memory_context', 'No prior known facts about this user.')}
+Use only the most recent fact if there are multiple versions. Do NOT narrate or reference what you previously knew — just respond naturally, as if you always knew this.
+
 ### QUESTION:
 {question}
 Answer:"""
     else:
         prompt = f"""Answer strictly from the context below. If not present, say
 "I don't have information about this in the uploaded documents."
+
+### WHAT YOU KNOW ABOUT THIS USER:
+{state.get('memory_context', 'No prior known facts about this user.')}
+Use only the most recent fact if there are multiple versions of the same information. Do NOT narrate, reference, or explain what you previously said or didn't know — just answer the current question directly and naturally, as if you always knew this.
 
 ### PAST CONVERSATION:
 {past_history}
@@ -174,10 +177,9 @@ Answer:"""
     })
     return {"answer": response.content}
 
-
 def evaluate_node(state: ChatState) -> dict:
     if state.get("is_casual"):
-        return {"confidence": 5.0}  # skip eval for casual, same as your current logic
+        return {"confidence": 5.0}
 
     score, _ = evaluate_response(
         state["original_question"], state["answer"], state.get("retrieval_info", ""),
@@ -192,8 +194,6 @@ def evaluate_node(state: ChatState) -> dict:
 
 
 def retry_node(state: ChatState) -> dict:
-    # ✅ Reformulate the query for the retry — re-grounds retrieval instead
-    # of just asking the LLM to "improve" its previous answer blind.
     reformulated = f"{state['original_question']} (provide more specific detail)"
     logger.warning("graph_retry_triggered", extra={
         "session_id": state["session_id"],
@@ -212,6 +212,13 @@ def finalize_node(state: ChatState) -> dict:
         save_to_semantic_cache(question, answer)
 
     return {"options": options}
+
+
+def save_memory_node(state: ChatState) -> dict:
+    def _save():
+        save_conversation_turn(state["original_question"], state["answer"], state["user_id"])
+    threading.Thread(target=_save, daemon=True).start()
+    return {}
 
 
 def escalate_flag_node(state: ChatState) -> dict:
@@ -254,16 +261,19 @@ def build_graph():
     graph = StateGraph(ChatState)
 
     graph.add_node("classify", classify_node)
+    graph.add_node("recall_memory", recall_memory_node)
     graph.add_node("cache_check", cache_check_node)
     graph.add_node("retrieve", retrieve_node)
     graph.add_node("generate", generate_node)
     graph.add_node("evaluate", evaluate_node)
     graph.add_node("retry", retry_node)
     graph.add_node("finalize", finalize_node)
+    graph.add_node("save_memory", save_memory_node)
     graph.add_node("escalate_flag", escalate_flag_node)
 
     graph.set_entry_point("classify")
-    graph.add_conditional_edges("classify", route_after_classify, {
+    graph.add_edge("classify", "recall_memory")
+    graph.add_conditional_edges("recall_memory", route_after_classify, {
         "generate": "generate", "cache_check": "cache_check",
     })
     graph.add_conditional_edges("cache_check", route_after_cache, {
@@ -274,8 +284,9 @@ def build_graph():
     graph.add_conditional_edges("evaluate", route_after_evaluate, {
         "finalize": "finalize", "retry": "retry", "escalate_flag": "escalate_flag",
     })
-    graph.add_edge("retry", "retrieve")  # the self-correction loop
+    graph.add_edge("retry", "retrieve")
     graph.add_edge("escalate_flag", "finalize")
-    graph.add_edge("finalize", END)
+    graph.add_edge("finalize", "save_memory")
+    graph.add_edge("save_memory", END)
 
     return graph.compile()

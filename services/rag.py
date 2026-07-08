@@ -16,10 +16,6 @@ from services.vectorstore import dense_retriever, bm25_retriever
 from graph_handler import graph_retrieve
 from config import RRF_K
 
-# ✅ get_answer() is always invoked from worker.py's process_message(), which
-# already calls set_trace_id(request_id) before reaching here. Reusing the
-# "worker" logger means every log line below automatically carries that
-# same trace_id/request_id — no need to pass it through every function.
 logger = logging.getLogger("worker")
 
 # ============================================================
@@ -51,37 +47,160 @@ def safe_invoke(llm_instance, prompt, max_retries=2, wait_seconds=20):
 # --- RETRIEVAL ---
 # ============================================================
 
-def reciprocal_rank_fusion(bm25_docs, dense_docs):
+def reciprocal_rank_fusion(list_of_doc_lists):
+    """
+    UPDATED: now accepts ANY number of document lists (was hardcoded to
+    exactly bm25_docs + dense_docs before). This lets RAG Fusion reuse the
+    same fusion math across many query-variation retrievals, not just the
+    2 retrievers for a single query.
+    """
     scores = {}
     doc_map = {}
-    for rank, doc in enumerate(bm25_docs, start=1):
-        key = doc.page_content
-        scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
-        doc_map[key] = doc
-    for rank, doc in enumerate(dense_docs, start=1):
-        key = doc.page_content
-        scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
-        doc_map[key] = doc
+    for doc_list in list_of_doc_lists:
+        for rank, doc in enumerate(doc_list, start=1):
+            key = doc.page_content
+            scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
+            doc_map[key] = doc
     ranked_keys = sorted(scores, key=lambda k: scores[k], reverse=True)
     return [doc_map[k] for k in ranked_keys]
 
 def hybrid_retrieve(question):
+    """Unchanged behavior — single-query BM25 + FAISS fusion. Still used
+    by graph_answer.py / graph_tools.py and as a fallback."""
     from services.vectorstore import bm25_retriever, dense_retriever
     bm25_docs = bm25_retriever.invoke(question)
     dense_docs = dense_retriever.invoke(question)
-    return reciprocal_rank_fusion(bm25_docs, dense_docs)
+    return reciprocal_rank_fusion([bm25_docs, dense_docs])
 
-def rerank_documents(question, docs, top_n=3):
+def generate_query_variations(question, n=3):
+    """
+    RAG Fusion step 1: generate n alternate phrasings of the question so
+    retrieval has a better chance of matching documents that use different
+    wording than the user's original question.
+    """
+    prompt = f"""Generate {n} different ways to phrase the following question,
+so that a search engine has a better chance of finding relevant documents,
+even if they use different wording than the original question.
+
+Reply with ONLY a JSON array of strings, nothing else, no markdown fences.
+
+QUESTION: {question}
+"""
+    try:
+        response = safe_invoke(eval_llm, prompt)
+        content = response.content.strip().replace("```json", "").replace("```", "").strip()
+        variations = json.loads(content)
+        if isinstance(variations, list) and variations:
+            return [question] + [v for v in variations[:n] if isinstance(v, str)]
+    except Exception:
+        logger.warning("query_variation_generation_failed", exc_info=True)
+    return [question]
+
+def rag_fusion_retrieve(question, n_variations=3):
+    """
+    RAG Fusion: retrieve using the original question PLUS n_variations
+    reformulated versions, then fuse everything with RRF. Replaces
+    hybrid_retrieve() as the retrieval step inside get_answer().
+    """
+    variations = generate_query_variations(question, n=n_variations)
+    from services.vectorstore import bm25_retriever, dense_retriever
+
+    all_doc_lists = []
+    for q in variations:
+        bm25_docs = bm25_retriever.invoke(q)
+        dense_docs = dense_retriever.invoke(q)
+        all_doc_lists.append(bm25_docs)
+        all_doc_lists.append(dense_docs)
+
+    fused = reciprocal_rank_fusion(all_doc_lists)
+    logger.info("rag_fusion_completed", extra={
+        "original_question": question[:80],
+        "num_variations": len(variations),
+        "num_fused_docs": len(fused),
+    })
+    return fused
+
+def is_academic_query(question):
+    """Detects questions likely about course content (syllabus, curriculum,
+    topics, etc.) rather than about a specific person. Used to decide
+    whether resume/CV documents should be excluded before reranking."""
+    academic_keywords = r"\b(syllabus|curriculum|course|module|semester|subject|topic|topics|lecture|class|chapter|unit|credits?|exam|assignment)\b"
+    return bool(re.search(academic_keywords, question.lower()))
+
+def is_person_document(source_filename):
+    """Detects resume/CV-style documents by filename. These are frequently
+    keyword-dense with tech terms (e.g. "Python, Flask, ...") which can
+    fool the reranker into treating them as relevant to course-content
+    questions when they're actually about a specific individual."""
+    person_doc_patterns = r"(resume|_cv\b|^cv\.|curriculum[_\s]?vitae)"
+    return bool(re.search(person_doc_patterns, source_filename.lower()))
+
+def filter_person_docs_for_academic_query(question, docs):
+    """If the question looks academic (about course content, not a
+    specific person), drop resume/CV documents before reranking so they
+    can't crowd out genuinely relevant course material."""
+    if not is_academic_query(question):
+        return docs
+    filtered = [d for d in docs if not is_person_document(d.metadata.get("source", ""))]
+    removed = len(docs) - len(filtered)
+    if removed > 0:
+        logger.info("person_docs_filtered_for_academic_query", extra={
+            "question": question[:80],
+            "removed_count": removed,
+        })
+    return filtered if filtered else docs  # never filter down to nothing
+
+
+def rerank_documents(question, docs, top_n=3, max_per_source=2):
+    """
+    UPDATED: added max_per_source cap. Without this, a single keyword-dense
+    document (e.g. a resume full of "Python, Flask, ...") can flood the
+    top_n results even when it's not actually relevant to the question,
+    because the cross-encoder reranker scores on textual overlap, not on
+    whether the source *type* matches the question's intent.
+
+    Ranks all candidates first (unchanged), then fills top_n by walking the
+    ranked list and skipping any source that has already hit max_per_source
+    slots. If fewer than top_n docs are found this way (e.g. very few
+    distinct sources), it backfills with the remaining best-ranked docs
+    regardless of the cap, so you still always get top_n results.
+    """
     from extensions import reranker
     from flashrank import RerankRequest
     if not docs or (len(docs) == 1 and docs[0].metadata.get("source") == "system"):
         return docs[:top_n]
+
     passages = [{"id": i, "text": doc.page_content} for i, doc in enumerate(docs)]
     rerank_request = RerankRequest(query=question, passages=passages)
     results = reranker.rerank(rerank_request)
-    top_results = sorted(results, key=lambda x: x["score"], reverse=True)[:top_n]
-    top_indices = [r["id"] for r in top_results]
-    return [docs[i] for i in top_indices]
+    ranked = sorted(results, key=lambda x: x["score"], reverse=True)
+
+    selected_indices = []
+    source_counts = {}
+    leftover_indices = []
+
+    for r in ranked:
+        idx = r["id"]
+        source = docs[idx].metadata.get("source", "unknown")
+        if source_counts.get(source, 0) < max_per_source:
+            selected_indices.append(idx)
+            source_counts[source] = source_counts.get(source, 0) + 1
+        else:
+            leftover_indices.append(idx)
+        if len(selected_indices) >= top_n:
+            break
+
+    if len(selected_indices) < top_n:
+        selected_indices.extend(leftover_indices[: top_n - len(selected_indices)])
+
+    logger.info("rerank_completed", extra={
+        "question": question[:80],
+        "num_candidates": len(docs),
+        "num_selected": len(selected_indices),
+        "distinct_sources": len(source_counts),
+    })
+
+    return [docs[i] for i in selected_indices]
 
 # ============================================================
 # --- QUERY HELPERS ---
@@ -92,10 +211,6 @@ def is_casual_query(question):
     if re.search(greetings, question.lower().strip()):
         return True
 
-    # ✅ Catch identity/meta questions about the bot itself — these were
-    # previously falling through to decompose_question(), which incorrectly
-    # split a single identity question into fake "parts", leading to broken
-    # replies unrelated to what was actually asked.
     identity_patterns = r"\b(about yourself|your goals|your purpose|your capabilities|your features|tell me more about you|introduce yourself|what are you)\b"
     if re.search(identity_patterns, question.lower().strip()):
         return True
@@ -109,7 +224,7 @@ def is_list_documents_query(question):
     return bool(re.search(patterns, question.lower().strip()))
 
 def decompose_question(question):
-    if is_casual_query(question) or is_list_documents_query(question):
+    if is_casual_query(question) or is_list_documents_query(question) or is_personal_statement(question):
         return [{"label": question, "question": question}]
 
     decompose_prompt = f"""Determine if the following user question contains MULTIPLE distinct, separately-answerable parts.
@@ -305,7 +420,8 @@ Answer:"""
         return cached, "SEMANTIC", "", []
 
     retrieval_start = time.time()
-    docs = hybrid_retrieve(question)
+    docs = rag_fusion_retrieve(question)   # CHANGED: was hybrid_retrieve(question)
+    docs = filter_person_docs_for_academic_query(question, docs)  # NEW: drop resume/CV docs for academic questions
     docs = rerank_documents(question, docs, top_n=6)
     retrieval_latency_ms = round((time.time() - retrieval_start) * 1000, 2)
     logger.info("retrieval_completed", extra={
@@ -370,7 +486,7 @@ Answer:"""
         context += doc.page_content[:600] + "\n\n"
 
     alpha = 0.7
-    retrieval_info = f"📊 Retrieved using: {int(alpha*100)}% Semantic (FAISS) + {int((1-alpha)*100)}% Keyword (BM25)\n📎 Sources: {', '.join(sources_set)}"
+    retrieval_info = f"📊 Retrieved using: RAG Fusion (multi-query) + {int(alpha*100)}% Semantic (FAISS) + {int((1-alpha)*100)}% Keyword (BM25)\n📎 Sources: {', '.join(sources_set)}"
 
     prompt = f"""You are an expert, smart, helpful document assistant. Your job is to answer questions based strictly on the provided context.
 
@@ -412,7 +528,6 @@ Answer:"""
     })
 
     options = generate_followup_options(question, answer)
-
     if "[Source:" not in answer and "[Type:" not in answer and "[FileID:" not in answer:
         save_to_redis_cache(question, answer)
         save_to_semantic_cache(question, answer)
@@ -420,3 +535,10 @@ Answer:"""
         logger.warning("bad_response_detected_skipping_cache", extra={"session_id": session_id})
 
     return answer, "NONE", retrieval_info, options
+
+def is_personal_statement(question):
+    """Detects simple first-person statements about the user (preferences,
+    facts about themselves) that don't need document retrieval — they're
+    for memory, not the knowledge base."""
+    personal_patterns = r"\bi\s+(?:actually|also|just|now|really)?\s*(prefer|like|love|hate|am\b|'m\b|work at|live in|study|was born|have a|own a)\b|\bmy\s+(favorite|favourite)\b|\bmy\s+name\s+is\b"
+    return bool(re.search(personal_patterns, question.lower().strip()))
