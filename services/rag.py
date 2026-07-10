@@ -151,19 +151,14 @@ def filter_person_docs_for_academic_query(question, docs):
     return filtered if filtered else docs  # never filter down to nothing
 
 
-def rerank_documents(question, docs, top_n=3, max_per_source=2):
+def rerank_documents(question, docs, top_n=6, max_per_source=3, min_score=0.05):
     """
-    UPDATED: added max_per_source cap. Without this, a single keyword-dense
-    document (e.g. a resume full of "Python, Flask, ...") can flood the
-    top_n results even when it's not actually relevant to the question,
-    because the cross-encoder reranker scores on textual overlap, not on
-    whether the source *type* matches the question's intent.
-
-    Ranks all candidates first (unchanged), then fills top_n by walking the
-    ranked list and skipping any source that has already hit max_per_source
-    slots. If fewer than top_n docs are found this way (e.g. very few
-    distinct sources), it backfills with the remaining best-ranked docs
-    regardless of the cap, so you still always get top_n results.
+    UPDATED: added min_score threshold. Previously, if max_per_source
+    caused genuinely relevant chunks to be skipped, the function would
+    backfill top_n using leftover docs regardless of their score — even
+    if that score was 0.0 (completely irrelevant). Now, backfill only
+    happens with docs scoring above min_score. If fewer than top_n
+    qualify, we return fewer docs rather than padding with garbage.
     """
     from extensions import reranker
     from flashrank import RerankRequest
@@ -181,12 +176,14 @@ def rerank_documents(question, docs, top_n=3, max_per_source=2):
 
     for r in ranked:
         idx = r["id"]
+        score = r["score"]
         source = docs[idx].metadata.get("source", "unknown")
         if source_counts.get(source, 0) < max_per_source:
             selected_indices.append(idx)
             source_counts[source] = source_counts.get(source, 0) + 1
-        else:
+        elif score >= min_score:
             leftover_indices.append(idx)
+        # else: score too low AND source already capped -> drop entirely
         if len(selected_indices) >= top_n:
             break
 
@@ -201,21 +198,70 @@ def rerank_documents(question, docs, top_n=3, max_per_source=2):
     })
 
     return [docs[i] for i in selected_indices]
-
 # ============================================================
 # --- QUERY HELPERS ---
 # ============================================================
+def is_personal_statement(question):
+    """Detects simple first-person statements about the user (preferences,
+    facts about themselves) that don't need document retrieval — they're
+    for memory, not the knowledge base."""
+    personal_patterns = r"\bi\s+(?:actually|also|just|now|really)?\s*(prefer|like|love|hate|am\b|'m\b|work at|live in|study|was born|have a|own a)\b|\bmy\s+(favorite|favourite)\b|\bmy\s+name\s+is\b"
+    return bool(re.search(personal_patterns, question.lower().strip()))
 
+def is_confirmation_or_statement(question):
+    """Detects simple agreement/confirmation/feedback statements that are
+    NOT questions (e.g. 'that's correct', 'yes she was there too'). These
+    should never go through decompose_question's LLM call, which tends to
+    mis-split them into fake 'sub-questions' since there's no real
+    question content to decompose.
+
+    NARROWED: previously any message without a question mark AND without
+    one of a small set of interrogative words was treated as a statement.
+    This caused real questions/requests phrased without those exact words
+    (e.g. "give me details about X", "summarize the syllabus") to be
+    wrongly routed as casual chit-chat, skipping retrieval entirely. Now
+    the catch-all only fires for genuinely short phrases (<=4 words), and
+    the interrogative list includes common imperative request-verbs too
+    (summarize/give/share/provide/...), so short real asks aren't
+    misclassified either. Longer messages default to NOT being a
+    statement — better to risk a mis-skipped decomposition than to
+    silently bypass retrieval for a real question.
+    """
+    q = question.lower().strip()
+
+    confirmation_starts = r"^(yes|yeah|yup|nope|no|correct|exactly|agreed|i agree|that'?s (correct|right|true|wrong|not right)|thats (correct|right|true|wrong)|sounds (right|good)|makes sense)\b"
+    if re.search(confirmation_starts, q):
+        return True
+    
+    implicit_question_starts = r"^(tell|explain|describe|show|give|from|about|regarding|summarize|summarise|elaborate|discuss|outline|detail|provide|share)"
+    if re.search(implicit_question_starts, q):
+        return False
+    
+    word_count = len(q.split())
+    if word_count <= 4:
+        interrogative_words = r"\b(what|who|when|where|why|how|which|whom|whose|can|could|do|does|did|is|are|will|would|should|explain|tell me|list|describe|summarize|summarise|give|share|provide|elaborate|discuss|outline|show|tell|detail|details)\b"
+        has_question_mark = "?" in question
+        has_interrogative = bool(re.search(interrogative_words, q))
+        if not has_question_mark and not has_interrogative:
+            return True
+
+    return False
 def is_casual_query(question):
-    greetings = r"\b(hi|hello|hey|greetings|good morning|good afternoon|good evening|wassup|yo|who are you|what is your name|how are you|what can you do|help|thanks|thank you|okay|ok|cool|nice|great|bye|goodbye|what do you mean|clarify|rephrase)\b"
-    if re.search(greetings, question.lower().strip()):
+    q = question.lower().strip()
+    
+    if len(q) <= 2:
         return True
-
-    identity_patterns = r"\b(about yourself|your goals|your purpose|your capabilities|your features|tell me more about you|introduce yourself|what are you)\b"
-    if re.search(identity_patterns, question.lower().strip()):
+    
+    # ✅ Personal statements and confirmations are casual
+    if is_personal_statement(question):
         return True
-
-    if re.match(r'^\d+\.?\s*$', question.strip()):
+    if is_confirmation_or_statement(question):
+        return True
+    
+    greetings = r"\b(hi|hello|hey|greetings|good morning|good afternoon|good evening|wassup|yo|who are you|what is your name|how are you|what can you do|help|thanks|thank you|okay|ok|cool|nice|great|bye|goodbye|what do you mean|clarify|rephrase|tell more|i prefer|more detail)\b"
+    if re.search(greetings, q):
+        return True
+    if re.match(r'^\d+\.?\s*$', q):
         return True
     return False
 
@@ -224,15 +270,36 @@ def is_list_documents_query(question):
     return bool(re.search(patterns, question.lower().strip()))
 
 def decompose_question(question):
-    if is_casual_query(question) or is_list_documents_query(question) or is_personal_statement(question):
+    if is_casual_query(question) or is_list_documents_query(question):
         return [{"label": question, "question": question}]
+    
+    # ✅ Only bypass decomposition, NOT retrieval
+    # These patterns are clearly single questions — skip LLM decomposition call
+    # but still go through normal RAG pipeline
+    single_question_patterns = r"^(tell me about|explain more|describe more|give me more|provide more)"
+    if re.match(single_question_patterns, question.lower().strip()):
+        return [{"label": question, "question": question}]
+    
+    # rest of decompose logic...
 
-    decompose_prompt = f"""Determine if the following user question contains MULTIPLE distinct, separately-answerable parts.
+    decompose_prompt = f"""You are a strict question analyzer. 
 
-If it has multiple distinct parts, split it into separate sub-questions.
-If it is a single question, return it unchanged as one part.
+ONLY split a question if it EXPLICITLY asks about 2 or more COMPLETELY DIFFERENT topics joined by "and", "also", "as well as", or similar connectors.
 
-Reply in this EXACT JSON format only, nothing else, no markdown fences:
+Examples that should NOT be split:
+- "can you tell about the ongoing capstone project" → SINGLE
+- "who are the members of the project under saurabh sir" → SINGLE  
+- "what are we doing in the capstone project" → SINGLE
+- "explain more about the punjabi dialect project" → SINGLE
+- "tell me about X" → SINGLE
+
+Examples that SHOULD be split:
+- "what is X and how does Y work" → MULTIPLE
+- "tell me about X and also about Y" → MULTIPLE
+
+If single, return the question unchanged as one part.
+
+Reply in this EXACT JSON format only, nothing else, no markdown:
 {{"parts": [{{"label": "short 3-5 word label", "question": "full standalone sub-question"}}]}}
 
 QUESTION: {question}
@@ -471,7 +538,24 @@ Answer:"""
         })
 
     if not docs or (len(docs) == 1 and docs[0].metadata.get("source") == "system"):
-        return "I don't have any uploaded documents to extract information from right now.", "NONE", "", []
+    # ✅ Fallback to LLM general knowledge
+       print("💡 No docs found — falling back to LLM general knowledge")
+       general_prompt = f"""You are a helpful AI assistant with broad general knowledge.
+    The user asked a question that is not covered in the uploaded documents.
+    Answer it using your general knowledge clearly and concisely.
+    At the end, mention that this answer is from general knowledge, not from uploaded documents.
+
+    ### PAST CONVERSATION:
+    {past_history}
+
+    ### QUESTION:
+    {question}
+
+    Answer:"""
+       response = safe_invoke(llm, general_prompt)
+       answer = response.content
+       options = generate_followup_options(question, answer)
+       return answer, "GENERAL_LLM", "💡 Answered from General Knowledge (not from uploaded documents)", options
 
     context = ""
     sources_set = set()
@@ -502,7 +586,7 @@ STRICT RULES — follow these without exception:
 9. If the document mentions a year or date, use that — do NOT use today's date or assume the current year is 2026.
 10. The following files have been DELETED — completely IGNORE any information from them: {blacklist_str}
 11. Keep your answer focused and concise — no unnecessary filler or repetition.
-
+12. NEVER mention File IDs, document identifiers, or phrases like "the document with FileID..." or "discussed in FileID..." anywhere in your answer. Simply state the information directly and naturally, as if you already know it — do not cite or reference which file/chunk it came from in any way. Source attribution is handled separately by the system, not by you.
 ### PAST CONVERSATION:
 {past_history}
 
@@ -536,9 +620,5 @@ Answer:"""
 
     return answer, "NONE", retrieval_info, options
 
-def is_personal_statement(question):
-    """Detects simple first-person statements about the user (preferences,
-    facts about themselves) that don't need document retrieval — they're
-    for memory, not the knowledge base."""
-    personal_patterns = r"\bi\s+(?:actually|also|just|now|really)?\s*(prefer|like|love|hate|am\b|'m\b|work at|live in|study|was born|have a|own a)\b|\bmy\s+(favorite|favourite)\b|\bmy\s+name\s+is\b"
-    return bool(re.search(personal_patterns, question.lower().strip()))
+
+

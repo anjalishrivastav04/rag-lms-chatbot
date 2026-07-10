@@ -550,6 +550,7 @@
         if (cache_source.includes('REDIS')) emoji = '🚀';
         if (cache_source.includes('SEMANTIC')) emoji = '🧠';
         if (cache_source.includes('KAFKA')) emoji = '📨';
+        if (cache_source.includes('GENERAL')) emoji = '💡';
         cacheDiv.textContent = `${emoji} ${cache_source}`;
         contentCol.appendChild(cacheDiv);
       }

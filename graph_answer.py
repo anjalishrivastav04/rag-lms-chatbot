@@ -15,7 +15,7 @@ from langgraph.graph import StateGraph, END
 from services.rag import (
     is_casual_query,
     is_list_documents_query,
-    is_personal_statement,   # NEW
+    is_personal_statement,
     hybrid_retrieve,
     rerank_documents,
     safe_invoke,
@@ -66,12 +66,13 @@ class ChatState(TypedDict):
 
 def classify_node(state: ChatState) -> dict:
     question = state["question"]
+    from services.rag import is_confirmation_or_statement
     logger.info("graph_classify", extra={
         "session_id": state["session_id"],
         "question": question[:80],
     })
     return {
-        "is_casual": is_casual_query(question) or is_personal_statement(question),
+        "is_casual": is_casual_query(question) or is_personal_statement(question) or is_confirmation_or_statement(question),
         "is_list_query": is_list_documents_query(question),
         "original_question": question,
         "retry_count": 0,
@@ -112,7 +113,10 @@ def retrieve_node(state: ChatState) -> dict:
     if blacklist:
         docs = [
             doc for doc in docs
-            if not any(bl.lower().rsplit('.', 1)[0] in doc.metadata.get("source", "").lower() for bl in blacklist)
+            if not any(
+                bl.lower().rsplit('.', 1)[0] in doc.metadata.get("source", "").lower()
+                for bl in blacklist
+            )
         ]
 
     graph_context, related_entities = graph_retrieve(question)
@@ -134,12 +138,23 @@ def retrieve_node(state: ChatState) -> dict:
         "retry_count": state.get("retry_count", 0),
     })
 
-    return {"docs": docs, "context": context + f"\n### KNOWLEDGE GRAPH:\n{graph_context}", "retrieval_info": retrieval_info}
+    return {
+        "docs": docs,
+        "context": context + f"\n### KNOWLEDGE GRAPH:\n{graph_context}",
+        "retrieval_info": retrieval_info
+    }
 
 
 def generate_node(state: ChatState) -> dict:
     question = state["question"]
     past_history = get_past_chat_history(state["session_id"], limit=6)
+    context = state.get("context", "")
+    docs = state.get("docs", [])
+
+    # ✅ Check docs directly — context may have graph text even with no docs
+    no_useful_docs = not docs or (
+        len(docs) == 1 and docs[0].metadata.get("source") == "system"
+    )
 
     if state.get("is_casual"):
         prompt = f"""You are RagBot, a friendly document assistant. Respond warmly and briefly.
@@ -151,7 +166,38 @@ Use only the most recent fact if there are multiple versions. Do NOT narrate or 
 ### QUESTION:
 {question}
 Answer:"""
+
+    elif no_useful_docs:
+        # ✅ No docs found — fall back to general LLM knowledge
+        print("💡 No relevant docs found — falling back to LLM general knowledge")
+        logger.info("graph_general_knowledge_fallback", extra={
+            "session_id": state["session_id"],
+            "question": question[:80],
+        })
+        prompt = f"""You are a helpful AI assistant with broad general knowledge.
+The user asked a question that is not covered in the uploaded documents.
+Answer it clearly and concisely using your general knowledge.
+At the end, add a note: "ℹ️ This answer is from general knowledge, not from uploaded documents."
+
+### PAST CONVERSATION:
+{past_history}
+
+### WHAT YOU KNOW ABOUT THIS USER:
+{state.get('memory_context', 'No prior known facts about this user.')}
+
+### QUESTION:
+{question}
+
+Answer:"""
+        response = safe_invoke(llm, prompt)
+        logger.info("graph_answer_generated", extra={
+            "session_id": state["session_id"],
+            "retry_count": state.get("retry_count", 0),
+        })
+        return {"answer": response.content, "cache_source": "GENERAL_LLM"}
+
     else:
+        # ✅ Docs found — answer from context
         prompt = f"""Answer strictly from the context below. If not present, say
 "I don't have information about this in the uploaded documents."
 
@@ -163,7 +209,7 @@ Use only the most recent fact if there are multiple versions of the same informa
 {past_history}
 
 ### CONTEXT:
-{state.get('context', '')}
+{context}
 
 ### QUESTION:
 {question}
@@ -177,21 +223,43 @@ Answer:"""
     })
     return {"answer": response.content}
 
+
 def evaluate_node(state: ChatState) -> dict:
     if state.get("is_casual"):
         return {"confidence": 5.0}
 
-    score, _ = evaluate_response(
-        state["original_question"], state["answer"], state.get("retrieval_info", ""),
-        state["user_id"], state["session_id"]
-    )
-    logger.info("graph_evaluated", extra={
-        "session_id": state["session_id"],
-        "confidence": score,
-        "retry_count": state.get("retry_count", 0),
-    })
-    return {"confidence": score}
+    if state.get("cache_source") == "GENERAL_LLM":
+        return {"confidence": 5.0}
 
+    answer = state.get("answer", "")
+
+    # ✅ CHANGED: previously only forced confidence=0 when docs were
+    # completely empty (no_docs). But the retriever almost always returns
+    # *something* — even if totally irrelevant to the question — so
+    # no_docs was rarely True in practice, and genuinely out-of-scope
+    # questions (e.g. "free tools for static analysis") were falling
+    # through to retry/escalate instead of the general-knowledge fallback,
+    # even though the LLM had already clearly said it had no info.
+    # Now we trust the LLM's own "I don't have information" signal
+    # regardless of how many (irrelevant) docs were retrieved.
+    if "I don't have information" in answer or "don't have information" in answer.lower():
+        return {"confidence": 0}
+
+    try:
+        score, _ = evaluate_response(
+            state["original_question"], state["answer"],
+            state.get("retrieval_info", ""),
+            state["user_id"], state["session_id"]
+        )
+        logger.info("graph_evaluated", extra={
+            "session_id": state["session_id"],
+            "confidence": score,
+            "retry_count": state.get("retry_count", 0),
+        })
+        return {"confidence": score}
+    except Exception as e:
+        print(f"⚠️ Evaluation failed: {e} — defaulting confidence to 3")
+        return {"confidence": 3}
 
 def retry_node(state: ChatState) -> dict:
     reformulated = f"{state['original_question']} (provide more specific detail)"
@@ -207,7 +275,11 @@ def finalize_node(state: ChatState) -> dict:
     question = state["original_question"]
     options = generate_followup_options(question, answer) if not state.get("is_casual") else []
 
-    if "[FileID:" not in answer and state.get("cache_source") != "REDIS" and state.get("cache_source") != "SEMANTIC":
+    if (
+        "[FileID:" not in answer and
+        state.get("cache_source") != "REDIS" and
+        state.get("cache_source") != "SEMANTIC"
+    ):
         save_to_redis_cache(question, answer)
         save_to_semantic_cache(question, answer)
 
@@ -216,7 +288,9 @@ def finalize_node(state: ChatState) -> dict:
 
 def save_memory_node(state: ChatState) -> dict:
     def _save():
-        save_conversation_turn(state["original_question"], state["answer"], state["user_id"])
+        save_conversation_turn(
+            state["original_question"], state["answer"], state["user_id"]
+        )
     threading.Thread(target=_save, daemon=True).start()
     return {}
 
@@ -228,6 +302,30 @@ def escalate_flag_node(state: ChatState) -> dict:
         "question": state["original_question"][:80],
     })
     return {"needs_escalation": True}
+
+
+def general_knowledge_node(state: ChatState) -> dict:
+    question = state["original_question"]
+    past_history = get_past_chat_history(state["session_id"], limit=6)
+    print("💡 Answer not in docs — falling back to LLM general knowledge")
+    logger.info("graph_general_knowledge_fallback", extra={
+        "session_id": state["session_id"],
+        "question": question[:80],
+    })
+    prompt = f"""You are a helpful AI assistant with broad general knowledge.
+The user asked a question that is not covered in the uploaded documents.
+Answer it clearly and concisely using your general knowledge.
+At the end, add a note: "ℹ️ This answer is from general knowledge, not from uploaded documents."
+
+### PAST CONVERSATION:
+{past_history}
+
+### QUESTION:
+{question}
+
+Answer:"""
+    response = safe_invoke(llm, prompt)
+    return {"answer": response.content, "cache_source": "GENERAL_LLM"}
 
 
 # ============================================================
@@ -243,15 +341,23 @@ def route_after_classify(state: ChatState) -> str:
 def route_after_cache(state: ChatState) -> str:
     return "finalize" if state.get("cache_source") in ("REDIS", "SEMANTIC") else "retrieve"
 
-
 def route_after_evaluate(state: ChatState) -> str:
+    if state.get("cache_source") == "GENERAL_LLM":
+        return "finalize"
+
     confidence = state.get("confidence")
+
+    # ✅ CHANGED: no_docs check removed — evaluate_node now only sets
+    # confidence=0 when the LLM explicitly said it has no info, so we can
+    # trust that signal directly without re-checking doc count here.
+    if confidence == 0:
+        return "general_knowledge"
+
     if confidence is None or confidence > RETRY_THRESHOLD:
         return "finalize"
     if confidence <= ESCALATE_THRESHOLD or state.get("retry_count", 0) >= MAX_RETRIES:
         return "escalate_flag"
     return "retry"
-
 
 # ============================================================
 # --- BUILD GRAPH ---
@@ -270,6 +376,7 @@ def build_graph():
     graph.add_node("finalize", finalize_node)
     graph.add_node("save_memory", save_memory_node)
     graph.add_node("escalate_flag", escalate_flag_node)
+    graph.add_node("general_knowledge", general_knowledge_node)
 
     graph.set_entry_point("classify")
     graph.add_edge("classify", "recall_memory")
@@ -282,10 +389,14 @@ def build_graph():
     graph.add_edge("retrieve", "generate")
     graph.add_edge("generate", "evaluate")
     graph.add_conditional_edges("evaluate", route_after_evaluate, {
-        "finalize": "finalize", "retry": "retry", "escalate_flag": "escalate_flag",
+        "finalize": "finalize",
+        "retry": "retry",
+        "escalate_flag": "escalate_flag",
+        "general_knowledge": "general_knowledge",
     })
     graph.add_edge("retry", "retrieve")
     graph.add_edge("escalate_flag", "finalize")
+    graph.add_edge("general_knowledge", "finalize")
     graph.add_edge("finalize", "save_memory")
     graph.add_edge("save_memory", END)
 
