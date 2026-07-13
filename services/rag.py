@@ -249,7 +249,8 @@ def is_confirmation_or_statement(question):
 def is_casual_query(question):
     q = question.lower().strip()
     
-    if len(q) <= 2:
+    # ✅ Catch very short inputs BUT not single digits (those are pending part selections)
+    if len(q) <= 2 and not q.isdigit():
         return True
     
     # ✅ Personal statements and confirmations are casual
@@ -282,25 +283,32 @@ def decompose_question(question):
     
     # rest of decompose logic...
 
-    decompose_prompt = f"""You are a strict question analyzer. 
+    decompose_prompt = f"""You are a strict question analyzer.
 
 ONLY split a question if it EXPLICITLY asks about 2 or more COMPLETELY DIFFERENT topics joined by "and", "also", "as well as", or similar connectors.
 
+IMPORTANT RULES:
+- The "question" field must ALWAYS be a full standalone sentence, NEVER a single word or phrase
+- The "label" is just a short 3-5 word summary tag
+- Synonyms like "students or members", "files or documents" count as ONE topic — do NOT split them
+- If in doubt, return as SINGLE
+
 Examples that should NOT be split:
+- "who are the students or members working under saurabh sir" → SINGLE
 - "can you tell about the ongoing capstone project" → SINGLE
-- "who are the members of the project under saurabh sir" → SINGLE  
+- "who are the members of the project under saurabh sir" → SINGLE
 - "what are we doing in the capstone project" → SINGLE
 - "explain more about the punjabi dialect project" → SINGLE
 - "tell me about X" → SINGLE
 
 Examples that SHOULD be split:
-- "what is X and how does Y work" → MULTIPLE
-- "tell me about X and also about Y" → MULTIPLE
+- "what is X and how does Y work" → MULTIPLE (two different topics)
+- "tell me about X and also about Y" → MULTIPLE (two different subjects)
 
-If single, return the question unchanged as one part.
+If single, return the question unchanged as one complete sentence.
 
 Reply in this EXACT JSON format only, nothing else, no markdown:
-{{"parts": [{{"label": "short 3-5 word label", "question": "full standalone sub-question"}}]}}
+{{"parts": [{{"label": "short 3-5 word label", "question": "full standalone sub-question as a complete sentence"}}]}}
 
 QUESTION: {question}
 """
