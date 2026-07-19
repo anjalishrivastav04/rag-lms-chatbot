@@ -65,7 +65,7 @@ def upload_file():
     if file.filename == "":
         return jsonify({"success": False, "message": "No file selected."})
     if not allowed_file(file.filename):
-        return jsonify({"success": False, "message": "Only PDF, TXT, and image files allowed!"})
+        return jsonify({"success": False, "message": "Only PDF files are allowed!"})
     try:
         filename = secure_filename(file.filename)
         filepath = os.path.join(UPLOAD_FOLDER, filename)
@@ -84,9 +84,11 @@ def upload_file():
                 return jsonify({"success": False, "message": f"OCR failed: {error}"})
             filename = os.path.basename(ocr_path)
             filepath = os.path.join(UPLOAD_FOLDER, filename)
-        ingest_documents()
+        chunk_counts = ingest_documents(filename)
         reload_vectorstore()
-        save_processed_file_info(user_id, filename, filepath, chunk_count=1)
+        redis_client.publish("vectorstore_updates", "reload")
+        real_chunk_count = chunk_counts.get(filename, 0)
+        save_processed_file_info(user_id, filename, filepath, chunk_count=real_chunk_count)
         return jsonify({
             "success": True,
             "message": f"✅ '{filename}' uploaded and processed successfully!",
@@ -131,6 +133,7 @@ def delete_document(filename):
 
         chunk_ids = get_chunk_ids_for_file(filename)
         print(f"📋 Pre-fetched {len(chunk_ids)} chunk IDs for: {filename}")
+        file_id_to_archive = file_record.file_id
 
         for fp in [filepath,
                    filepath.rsplit('.', 1)[0] + '_ocr.txt',
@@ -140,7 +143,14 @@ def delete_document(filename):
                 print(f"🗑️ Deleted file: {fp}")
 
         db.session.delete(file_record)
-        add_to_blacklist(filename)
+    
+
+        try:
+            from services.vectorstore import archive_file_chunks
+            archived_count = archive_file_chunks(file_id_to_archive)
+            print(f"🗄️ Archived {archived_count} chunks via status metadata for file_id={file_id_to_archive}")
+        except Exception as e:
+            print(f"⚠️ archive_file_chunks failed: {e}")
 
         try:
             delete_graph_for_file(filename)
@@ -150,11 +160,10 @@ def delete_document(filename):
         delete_source_index(filename)
 
         try:
-            redis_client.flushdb()
             add_to_blacklist(filename)
-            print("🗑️ Cleared ALL Redis cache and re-added blacklist entry")
+            print("🗑️ Added file to blacklist")
         except Exception as e:
-            print(f"⚠️ Redis flush warning: {e}")
+            print(f"⚠️ Blacklist warning: {e}")
 
         try:
             SemanticCacheRecord.query.delete()
@@ -222,6 +231,7 @@ def delete_document(filename):
             print(f"⚠️ Record manager cleanup: {e}")
 
         reload_vectorstore()
+        redis_client.publish("vectorstore_updates", "reload")
         return jsonify({
             "success": True,
             "message": f"🗑️ '{filename}' and ALL related cache/data deleted successfully!"

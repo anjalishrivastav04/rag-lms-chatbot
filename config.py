@@ -10,8 +10,8 @@ SECRET_KEY = "123456"
 
 # --- FILE UPLOAD ---
 UPLOAD_FOLDER = "documents"
-ALLOWED_EXTENSIONS = {"pdf", "txt", "jpg", "jpeg", "png", "bmp", "gif"}
-OCR_SUPPORTED = {"jpg", "jpeg", "png", "bmp", "gif"}
+ALLOWED_EXTENSIONS = ALLOWED_EXTENSIONS = {"pdf"}
+OCR_SUPPORTED = set()
 
 # --- POSTGRESQL ---
 DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/postgres')

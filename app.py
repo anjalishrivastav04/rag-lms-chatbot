@@ -21,7 +21,7 @@ app.wsgi_app = RequestIdMiddleware(app.wsgi_app)
 # ============================================================
 # --- CONFIG ---
 # ============================================================
-
+app.config['WTF_CSRF_TIME_LIMIT'] = None
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv(
     'DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/postgres'
 )
@@ -139,28 +139,41 @@ print("✅ Cache cleanup scheduler started (runs every 4 hours)")
 # ============================================================
 
 if __name__ == "__main__":
+    from ingest import ingest_documents
+
     with app.app_context():
         from extensions import db
         from models.models import User, ProcessedFile
         db.create_all()
+
         # Sync existing documents
         from routes.admin import save_processed_file_info
-        from ingest import ingest_documents
-        import os
+
         UPLOAD_FOLDER = "documents"
         if os.path.exists(UPLOAD_FOLDER):
             admin_user = User.query.filter_by(is_admin=True).first()
             if admin_user:
                 synced = 0
+                newly_synced_filenames = []
                 for filename in os.listdir(UPLOAD_FOLDER):
-                    if '.' in filename and filename.rsplit('.', 1)[1].lower() in {"pdf", "txt", "jpg", "jpeg", "png", "bmp", "gif"}:
+                    if '.' in filename and filename.rsplit('.', 1)[1].lower() == "pdf":
                         filepath = os.path.join(UPLOAD_FOLDER, filename)
                         if os.path.isfile(filepath) and not ProcessedFile.query.filter_by(filename=filename).first():
                             save_processed_file_info(admin_user.id, filename, filepath, chunk_count=0)
+                            newly_synced_filenames.append(filename)
                             synced += 1
+
                 if synced > 0:
                     print(f"✅ Synced {synced} documents")
-                    ingest_documents()
+                    chunk_counts = {}
+                    for fname in newly_synced_filenames:
+                        chunk_counts.update(ingest_documents(fname))
+                    for fname in newly_synced_filenames:
+                        real_count = chunk_counts.get(fname, 0)
+                        record = ProcessedFile.query.filter_by(filename=fname).first()
+                        if record:
+                           record.chunk_count = real_count
+                    db.session.commit()
 
     from services.vectorstore import initialize_vectorstore
     initialize_vectorstore()

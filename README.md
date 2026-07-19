@@ -12,7 +12,7 @@
 | **Reranking** | FlashRank (`ms-marco-TinyBERT-L-2-v2`) |
 | **Knowledge Graph** | Neo4j (Neo4j Desktop, local instance, Bolt protocol) |
 | **LLM Provider** | Groq API |
-| **LLM Models Used** | `llama-3.3-70b-versatile`, `llama-3.1-8b-instant` |
+| **LLM Models Used** | `llama-3.1-8b-instant`, `llama-3.1-8b-instant` |
 | **Embeddings Model** | `all-MiniLM-L6-v2` (Sentence-Transformers + HuggingFace) |
 | **OCR Engine** | EasyOCR |
 | **Image/Vision Understanding** | Google Vision API |

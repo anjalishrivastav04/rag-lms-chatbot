@@ -197,6 +197,11 @@ Answer:"""
         return {"answer": response.content, "cache_source": "GENERAL_LLM"}
 
     else:
+        logger.info("graph_context_debug", extra={
+        "session_id": state["session_id"],
+        "doc_sources": [d.metadata.get("source") for d in docs],
+        "context_preview": context[:1500],
+    })
         # ✅ Docs found — answer from context
         prompt = f"""Answer strictly from the context below. If not present, say
 "I don't have information about this in the uploaded documents."
@@ -347,10 +352,16 @@ def route_after_evaluate(state: ChatState) -> str:
 
     confidence = state.get("confidence")
 
-    # ✅ CHANGED: no_docs check removed — evaluate_node now only sets
-    # confidence=0 when the LLM explicitly said it has no info, so we can
-    # trust that signal directly without re-checking doc count here.
     if confidence == 0:
+        docs = state.get("docs", [])
+        has_useful_docs = docs and not (
+            len(docs) == 1 and docs[0].metadata.get("source") == "system"
+        )
+        # If real docs were retrieved but the LLM still claimed no info,
+        # give it one reformulated retry before writing off the docs
+        # entirely and falling back to general knowledge.
+        if has_useful_docs and state.get("retry_count", 0) < MAX_RETRIES:
+            return "retry"
         return "general_knowledge"
 
     if confidence is None or confidence > RETRY_THRESHOLD:
@@ -358,7 +369,6 @@ def route_after_evaluate(state: ChatState) -> str:
     if confidence <= ESCALATE_THRESHOLD or state.get("retry_count", 0) >= MAX_RETRIES:
         return "escalate_flag"
     return "retry"
-
 # ============================================================
 # --- BUILD GRAPH ---
 # ============================================================
