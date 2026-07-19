@@ -21,7 +21,7 @@ def get_driver():
 # fast model tends to misclassify or default to generic labels when
 # given that many options to choose from in one prompt.
 llm = ChatGroq(
-    model="llama-3.1-8b-instant",
+    model="llama-3.3-70b-versatile",
     temperature=0,
     api_key=os.getenv("GROQ_API_KEY"))
 

@@ -3,6 +3,7 @@ import re
 import redis
 import uuid
 import hashlib
+import chromadb
 from dotenv import load_dotenv
 from graph_handler import build_graph_from_chunks, delete_graph_for_file
 
@@ -29,7 +30,7 @@ POPPLER_PATH = r"C:\Users\iaman\OneDrive\Documents\Desktop\poppler-26.02.0\Libra
 redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 
 # --- GROQ LLM ---
-llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, api_key=os.getenv("GROQ_API_KEY"))
+llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, api_key=os.getenv("GROQ_API_KEY"))
 
 # --- EMBEDDINGS ---
 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
@@ -525,15 +526,13 @@ def ingest_documents(file_name):
         return file_chunk_counts
 
     # --- CHROMADB WORKSPACE INDEX HANDLING ---
-    chroma_dir = "chroma_vectorstore"
-
-    print("💾 Connecting to ChromaDB collection for synchronization...")
+    chroma_client = chromadb.HttpClient(host="localhost", port=8000)
+    print("💾 Connecting to ChromaDB server for synchronization...")
     vectorstore = Chroma(
+        client=chroma_client,
         collection_name="rag_documents",
         embedding_function=embeddings,
-        persist_directory=chroma_dir
     )
-
     print(f"🔀 Running parallel deduplication for {len(all_chunks)} incoming chunks...")
 
     try:
@@ -567,10 +566,10 @@ def ingest_documents(file_name):
 
         vectorstore.delete_collection()
         vectorstore = Chroma.from_documents(
-            all_chunks, embeddings,
-            collection_name="rag_documents",
-            persist_directory=chroma_dir
-        )
+        all_chunks, embeddings,
+        client=chroma_client,
+        collection_name="rag_documents",
+      )
         print("✅ Vector database re-indexed from this run's chunks only.")
         print("⚠️ NOTE: This was a partial recovery — only chunks processed in this run are indexed.")
         print("⚠️ Files that were already indexed in prior runs and were NOT re-uploaded this time")

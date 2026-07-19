@@ -1,13 +1,15 @@
 import os
 import re
+import chromadb
 from langchain_chroma import Chroma
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from extensions import embeddings
 from config import UPLOAD_FOLDER, ALLOWED_EXTENSIONS
 
-VECTORSTORE_DIR = "chroma_vectorstore"
 COLLECTION_NAME = "rag_documents"
+CHROMA_HOST = "localhost"
+CHROMA_PORT = 8000
 
 vectorstore = None
 ALL_DOCS = []
@@ -21,15 +23,17 @@ def is_not_archived(metadata: dict) -> bool:
     search itself, instead of after."""
     return metadata.get("status", "active") != "archived"
 
+def get_chroma_client():
+    return chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
 
 def initialize_vectorstore():
     global vectorstore, ALL_DOCS, dense_retriever, bm25_retriever
 
     try:
         vs = Chroma(
+            client=get_chroma_client(),
             collection_name=COLLECTION_NAME,
             embedding_function=embeddings,
-            persist_directory=VECTORSTORE_DIR
         )
         raw = vs.get(include=["documents", "metadatas"])
         docs = [
@@ -42,8 +46,6 @@ def initialize_vectorstore():
             print(f"📚 System successfully mapped {len(valid_docs)} document pieces into the runtime index context.")
             vectorstore = vs
             ALL_DOCS = valid_docs
-            # Real metadata filtering, evaluated by ChromaDB during the
-            # search itself — not a post-search Python filter like FAISS.
             dense_retriever = vs.as_retriever(
                 search_kwargs={"k": 10, "filter": {"status": {"$ne": "archived"}}}
             )
@@ -59,8 +61,8 @@ def initialize_vectorstore():
     )
     vs = Chroma.from_documents(
         [dummy_doc], embeddings,
+        client=get_chroma_client(),
         collection_name=COLLECTION_NAME,
-        persist_directory=VECTORSTORE_DIR
     )
     vectorstore = vs
     ALL_DOCS = [dummy_doc]
@@ -69,7 +71,6 @@ def initialize_vectorstore():
     )
     bm25_retriever = BM25Retriever.from_documents([dummy_doc], k=10)
     return vs, [dummy_doc]
-
 
 def reload_vectorstore():
     global vectorstore, dense_retriever, bm25_retriever, ALL_DOCS

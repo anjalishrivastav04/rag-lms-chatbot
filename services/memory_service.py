@@ -27,7 +27,7 @@ _config = {
     "llm": {
         "provider": "groq",
         "config": {
-            "model": "llama-3.1-8b-instant",
+            "model": "llama-3.3-70b-versatile",
         }
     },
     "embedder": {
