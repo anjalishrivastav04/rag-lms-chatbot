@@ -2,6 +2,8 @@ import os
 import re
 import glob
 import redis
+import hashlib
+import fitz  # PyMuPDF - for detecting & extracting embedded images per page
 import uuid
 from dotenv import load_dotenv
 from graph_handler import build_graph_from_chunks, delete_graph_for_file
@@ -129,6 +131,67 @@ def detect_chunking_method(content):
 # -------------------------------------------
 # GET SPLITTER
 # -------------------------------------------
+def extract_embedded_image_text(pdf_doc, page_num, main_text):
+    """
+    Finds embedded images on a given page (0-indexed) of an ALREADY-OPEN
+    fitz document, runs OCR on each, and returns their text — skipping
+    tiny/decorative images, low-confidence OCR noise, and text already
+    substantially present in the page's main extracted text.
+    """
+    ocr_blocks = []
+    MIN_OCR_CONFIDENCE = 0.40  # tune this based on real-world results
+
+    try:
+        page = pdf_doc[page_num]
+        image_list = page.get_images(full=True)
+
+        for img_index, img_info in enumerate(image_list):
+            xref = img_info[0]
+            try:
+                base_image = pdf_doc.extract_image(xref)
+                image_bytes = base_image["image"]
+                image_ext = base_image["ext"]
+
+                if len(image_bytes) < 5000:
+                    continue
+
+                temp_img_path = f"documents/temp_embedded_{page_num + 1}_{img_index}.{image_ext}"
+                with open(temp_img_path, "wb") as f:
+                    f.write(image_bytes)
+
+                try:
+                    ocr_text, confidence = extract_text_from_image(temp_img_path)
+                finally:
+                    if os.path.exists(temp_img_path):
+                        os.remove(temp_img_path)
+
+                if not ocr_text or not ocr_text.strip():
+                    continue
+
+                # ✅ Skip low-confidence OCR — usually seals, watermarks,
+                # or logos where OCR guesses garbage text rather than
+                # extracting real content.
+                if confidence is not None and confidence < MIN_OCR_CONFIDENCE:
+                    continue
+
+                ocr_words = set(re.findall(r'\w+', ocr_text.lower()))
+                main_words = set(re.findall(r'\w+', main_text.lower()))
+                if ocr_words:
+                    overlap = len(ocr_words & main_words) / len(ocr_words)
+                    if overlap > 0.7:
+                        continue
+
+                ocr_blocks.append(ocr_text.strip())
+
+            except Exception as img_err:
+                print(f"⚠️ Could not process embedded image {img_index} on page {page_num + 1}: {img_err}")
+                continue
+
+    except Exception as e:
+        print(f"⚠️ Could not process embedded images for page {page_num + 1}: {e}")
+
+    return ocr_blocks
+
 def get_splitter(method):
     print(f"✂️ Applying chunking method: {method}")
 
@@ -240,65 +303,79 @@ def ingest_documents():
                 print(f"🔍 Loading PDF layout layers...")
                 loader = PyPDFLoader(path)
                 raw_pdf_docs = loader.load()
-                
-                for page_num, doc in enumerate(raw_pdf_docs):
-                    text_content = doc.page_content.strip()
-                    
-                    clean_char_count = len(re.sub(r'\s+', '', text_content))
-                    
-                    is_spaced_out = False
-                    if len(text_content) > 0:
-                        single_letters = len(re.findall(r'\b[a-zA-Z]\b', text_content))
-                        total_words = max(len(text_content.split()), 1)
-                        if (single_letters / total_words) > 0.40:
-                            is_spaced_out = True
-                    
-                    if clean_char_count > 30 and not is_spaced_out:
-                        docs.append(doc)
-                    else:
-                        print(f"📸 Page {page_num + 1} flagged as image scan or broken layout. Initiating OCR fallback...")
-                        try:
-                            # 🌟 PASSED POPPLER BINARIES PATH DIRECTLY HERE:
-                            images = convert_from_path(
-                                path, 
-                                first_page=page_num + 1, 
-                                last_page=page_num + 1, 
-                                dpi=300,
-                                poppler_path=POPPLER_PATH
-                            )
-                            if images:
-                                temp_img_path = f"documents/temp_page_{page_num + 1}.jpg"
-                                images[0].save(temp_img_path, 'JPEG')
-                                
-                                ocr_text, confidence = extract_text_from_image(temp_img_path)
-                                
-                                if ocr_text and ocr_text.strip():
-                                    print(f"✨ Successfully extracted clean text from PDF Page {page_num + 1}!")
-                                    docs.append(Document(
-                                        page_content=ocr_text,
-                                        metadata={
-                                            "source": filename,
-                                            "page": page_num + 1
-                                        }
-                                    ))
-                                else:
-                                    print(f"⚠️ OCR returned empty text for Page {page_num + 1}. Falling back to original (low-quality) text.")
-                                    doc.metadata["degraded"] = True
-                                    doc.metadata["degraded_reason"] = "ocr_empty"
-                                    docs.append(doc)
-                                
-                                if os.path.exists(temp_img_path):
-                                    os.remove(temp_img_path)
-                            else:
-                                print(f"⚠️ No image rendered for Page {page_num + 1}. Falling back to original (low-quality) text.")
-                                doc.metadata["degraded"] = True
-                                doc.metadata["degraded_reason"] = "no_image_rendered"
-                                docs.append(doc)
-                        except Exception as pdf_img_err:
-                            print(f"⚠️ Image-to-PDF parser skipped Page {page_num + 1}: {pdf_img_err}")
-                            doc.metadata["degraded"] = True
-                            doc.metadata["degraded_reason"] = f"ocr_exception: {pdf_img_err}"
+
+                fitz_doc = None
+                try:
+                   fitz_doc = fitz.open(path)
+
+                   for page_num, doc in enumerate(raw_pdf_docs): 
+                        text_content = doc.page_content.strip()
+                        clean_char_count = len(re.sub(r'\s+', '', text_content))
+                        is_spaced_out = False
+                        if len(text_content) > 0:
+                            single_letters = len(re.findall(r'\b[a-zA-Z]\b', text_content))
+                            total_words = max(len(text_content.split()), 1)
+                            if (single_letters / total_words) > 0.40:
+                               is_spaced_out = True
+                        if clean_char_count > 30 and not is_spaced_out:
+                # ✅ Good selectable text — but may ALSO contain embedded
+                # images with their own text (screenshots, scanned
+                # signatures, diagrams, tables, etc.)
+                            embedded_ocr_blocks = extract_embedded_image_text(fitz_doc, page_num, text_content)
+
+                            if embedded_ocr_blocks:     
+                               print(f"🖼️ Page {page_num + 1}: found {len(embedded_ocr_blocks)} embedded image(s) with extractable text — merging.")
+                               doc.page_content = text_content + "\n\n=== TEXT FROM EMBEDDED IMAGES ===\n" + "\n\n".join(embedded_ocr_blocks)
+                               doc.metadata["has_embedded_image_text"] = True
+
                             docs.append(doc)
+                        else:
+                            print(f"📸 Page {page_num + 1} flagged as image scan or broken layout. Initiating OCR fallback...")
+                            try:
+                    # 🌟 PASSED POPPLER BINARIES PATH DIRECTLY HERE:
+                                images = convert_from_path(
+                                    path, 
+                                    first_page=page_num + 1, 
+                                    last_page=page_num + 1, 
+                                    dpi=300,
+                                    poppler_path=POPPLER_PATH
+                                )
+                                if images:
+                                    temp_img_path = f"documents/temp_page_{page_num + 1}.jpg"
+                                    images[0].save(temp_img_path, 'JPEG')
+                        
+                                    ocr_text, confidence = extract_text_from_image(temp_img_path)
+                        
+                                    if ocr_text and ocr_text.strip():
+                                        print(f"✨ Successfully extracted clean text from PDF Page {page_num + 1}!")
+                                        docs.append(Document(
+                                            page_content=ocr_text,
+                                            metadata={
+                                                "source": filename,
+                                                "page": page_num + 1
+                                            }
+                                       ))
+                                    else:
+                                        print(f"⚠️ OCR returned empty text for Page {page_num + 1}. Falling back to original (low-quality) text.")
+                                        doc.metadata["degraded"] = True
+                                        doc.metadata["degraded_reason"] = "ocr_empty"
+                                        docs.append(doc)
+                        
+                                    if os.path.exists(temp_img_path):
+                                       os.remove(temp_img_path)
+                                else:
+                                    print(f"⚠️ No image rendered for Page {page_num + 1}. Falling back to original (low-quality) text.")
+                                    doc.metadata["degraded"] = True
+                                    doc.metadata["degraded_reason"] = "no_image_rendered"
+                                    docs.append(doc)
+                            except Exception as pdf_img_err:
+                                print(f"⚠️ Image-to-PDF parser skipped Page {page_num + 1}: {pdf_img_err}")
+                                doc.metadata["degraded"] = True
+                                doc.metadata["degraded_reason"] = f"ocr_exception: {pdf_img_err}"
+                                docs.append(doc)
+                finally:
+                    if fitz_doc is not None:
+                        fitz_doc.close()
 
             # 3. Handle Pure Image Files with Toggle Configuration
             elif any(filename_lower.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.gif']):
