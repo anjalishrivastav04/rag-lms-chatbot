@@ -1,12 +1,16 @@
 import os
 import re
-from langchain_community.vectorstores import FAISS
+import chromadb
+from langchain_chroma import Chroma
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from extensions import embeddings
 from config import UPLOAD_FOLDER, ALLOWED_EXTENSIONS
 
-VECTORSTORE_DIR = "vectorstore"
+CHROMA_COLLECTION_NAME = "rag_documents"
+
+def get_chroma_client():
+    return chromadb.HttpClient(host="localhost", port=8000)
 
 vectorstore = None
 ALL_DOCS = []
@@ -15,27 +19,40 @@ bm25_retriever = None
 
 def initialize_vectorstore():
     global vectorstore, ALL_DOCS, dense_retriever, bm25_retriever
-    if os.path.exists(VECTORSTORE_DIR) and os.path.exists(os.path.join(VECTORSTORE_DIR, "index.faiss")):
-        try:
-            vs = FAISS.load_local(VECTORSTORE_DIR, embeddings, allow_dangerous_deserialization=True)
-            docs = [vs.docstore.search(idx) for idx in vs.index_to_docstore_id.values()]
-            valid_docs = [d for d in docs if d.metadata.get("source") != "system"]
-            if valid_docs:
-                print(f"📚 System successfully mapped {len(valid_docs)} document pieces into the runtime index context.")
-                vectorstore = vs
-                ALL_DOCS = valid_docs
-                dense_retriever = vs.as_retriever(search_kwargs={"k": 10})
-                bm25_retriever = BM25Retriever.from_documents(valid_docs, k=10)
-                return vs, valid_docs
-        except Exception as e:
-            print(f"⚠️ Error loading vectorstore: {e}. Reinitializing.")
+    try:
+        client = get_chroma_client()
+        vs = Chroma(
+            client=client,
+            collection_name=CHROMA_COLLECTION_NAME,
+            embedding_function=embeddings,
+        )
+        existing = vs.get(include=["metadatas", "documents"])
+        docs = [
+            Document(page_content=content, metadata=meta)
+            for content, meta in zip(existing.get("documents", []), existing.get("metadatas", []))
+        ]
+        valid_docs = [d for d in docs if d.metadata.get("source") != "system"]
+        if valid_docs:
+            print(f"📚 System successfully mapped {len(valid_docs)} document pieces into the runtime index context.")
+            vectorstore = vs
+            ALL_DOCS = valid_docs
+            dense_retriever = vs.as_retriever(search_kwargs={"k": 10})
+            bm25_retriever = BM25Retriever.from_documents(valid_docs, k=10)
+            return vs, valid_docs
+    except Exception as e:
+        print(f"⚠️ Error loading vectorstore: {e}. Reinitializing.")
 
     print("⚠️ No valid document data discovered yet. Standing by for upload files...")
     dummy_doc = Document(
         page_content="No documents have been uploaded yet.",
         metadata={"source": "system", "filetype": "txt", "chunk_index": 0}
     )
-    vs = FAISS.from_documents([dummy_doc], embeddings)
+    client = get_chroma_client()
+    vs = Chroma.from_documents(
+        [dummy_doc], embeddings,
+        client=client,
+        collection_name=CHROMA_COLLECTION_NAME,
+    )
     vectorstore = vs
     ALL_DOCS = [dummy_doc]
     dense_retriever = vs.as_retriever(search_kwargs={"k": 10})

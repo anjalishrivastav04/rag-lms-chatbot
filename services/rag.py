@@ -3,9 +3,10 @@ import json
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor 
-from langchain_community.vectorstores import FAISS
+from langchain_chroma import Chroma
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
+from services.intent_classifier import classify_intent
 from extensions import db, llm, eval_llm, embeddings, embedder
 from models.models import ProcessedFile
 from services.cache import (
@@ -203,9 +204,13 @@ def rerank_documents(question, docs, top_n=6, max_per_source=3, min_score=0.05):
 # --- QUERY HELPERS ---
 # ============================================================
 def is_personal_statement(question):
-    """Detects simple first-person statements about the user (preferences,
-    facts about themselves) that don't need document retrieval — they're
-    for memory, not the knowledge base."""
+    intent, confidence = classify_intent(question)
+    
+    # Classifier confident hai — uski baat maano, chahe jo bhi category ho
+    if confidence >= 0.60:
+        return intent == "personal_statement"
+    
+    # Classifier confused hai — purane regex pe fallback karo
     personal_patterns = r"\bi\s+(?:actually|also|just|now|really)?\s*(prefer|like|love|hate|am\b|'m\b|work at|live in|study|was born|have a|own a)\b|\bmy\s+(favorite|favourite)\b|\bmy\s+name\s+is\b"
     return bool(re.search(personal_patterns, question.lower().strip()))
 
@@ -247,24 +252,32 @@ def is_confirmation_or_statement(question):
             return True
 
     return False
+
 def is_casual_query(question):
-    q = question.lower().strip()
+    intent, confidence = classify_intent(question)
     
-    # ✅ Catch very short inputs BUT not single digits (those are pending part selections)
+    if confidence >= 0.60:
+        if intent == "greeting":
+            return True
+        # Agar confident hai but "greeting" nahi hai, toh yahan se return False
+        # kar sakte hain doosre casual checks (personal/confirmation) allow karne ke liye,
+        # lekin regex-greetings ko skip kar dete hain kyunki classifier ne confidently
+        # "greeting" ke alawa kuch aur bola hai
+    
+    q = question.lower().strip()
     if len(q) <= 2 and not q.isdigit():
         return True
-    
-    # ✅ Personal statements and confirmations are casual
     if is_personal_statement(question):
         return True
     if is_confirmation_or_statement(question):
         return True
     
-    greetings = r"\b(hi|hello|hey|greetings|good morning|good afternoon|good evening|wassup|yo|who are you|what is your name|how are you|what can you do|help|thanks|thank you|okay|ok|cool|nice|great|bye|goodbye|what do you mean|clarify|rephrase|tell more|i prefer|more detail)\b"
-    if re.search(greetings, q):
-        return True
-    if re.match(r'^\d+\.?\s*$', q):
-        return True
+    if confidence < 0.60:  # sirf tabhi regex-greetings check karo jab classifier unsure ho
+        greetings = r"\b(hi|hello|hey|greetings|good morning|good afternoon|good evening|wassup|yo|who are you|what is your name|how are you|what can you do|help|thanks|thank you|okay|ok|cool|nice|great|bye|goodbye|what do you mean|clarify|rephrase|tell more|i prefer|more detail)\b"
+        if re.search(greetings, q):
+            return True
+        if re.match(r'^\d+\.?\s*$', q):
+            return True
     return False
 
 def is_list_documents_query(question):
@@ -419,7 +432,6 @@ def ingest_feedback_to_vectorstore(question, correct_answer, feedback_id):
         )
         if vs_module.vectorstore:
             vs_module.vectorstore.add_documents([doc])
-            vs_module.vectorstore.save_local("vectorstore")
             vs_module.ALL_DOCS.append(doc)
             vs_module.bm25_retriever = BM25Retriever.from_documents(vs_module.ALL_DOCS, k=6)
             cache_response_with_ttl(
@@ -432,8 +444,12 @@ def ingest_feedback_to_vectorstore(question, correct_answer, feedback_id):
             logger.info("feedback_ingested", extra={"feedback_id": feedback_id, "question": question[:50]})
             return True
         else:
-            vs_module.vectorstore = FAISS.from_documents([doc], embeddings)
-            vs_module.vectorstore.save_local("vectorstore")
+            from services.vectorstore import get_chroma_client, CHROMA_COLLECTION_NAME
+            vs_module.vectorstore = Chroma.from_documents(
+                [doc], embeddings,
+                client=get_chroma_client(),
+                collection_name=CHROMA_COLLECTION_NAME,
+            )
             vs_module.ALL_DOCS.append(doc)
             vs_module.bm25_retriever = BM25Retriever.from_documents(vs_module.ALL_DOCS, k=6)
             logger.info("vectorstore_created_from_feedback", extra={"feedback_id": feedback_id})
@@ -579,7 +595,7 @@ Answer:"""
         context += doc.page_content[:600] + "\n\n"
 
     alpha = 0.7
-    retrieval_info = f"📊 Retrieved using: RAG Fusion (multi-query) + {int(alpha*100)}% Semantic (FAISS) + {int((1-alpha)*100)}% Keyword (BM25)\n📎 Sources: {', '.join(sources_set)}"
+    retrieval_info = f"📊 Retrieved using: RAG Fusion (multi-query) + {int(alpha*100)}% Semantic (ChromaDB) + {int((1-alpha)*100)}% Keyword (BM25)\n📎 Sources: {', '.join(sources_set)}"
 
     prompt = f"""You are an expert, smart, helpful document assistant. Your job is to answer questions based strictly on the provided context.
 

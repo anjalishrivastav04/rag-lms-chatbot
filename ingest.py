@@ -2,6 +2,9 @@ import os
 import re
 import glob
 import redis
+import chromadb
+import hashlib
+import fitz  # PyMuPDF - for detecting & extracting embedded images per page
 import uuid
 from dotenv import load_dotenv
 from graph_handler import build_graph_from_chunks, delete_graph_for_file
@@ -11,7 +14,7 @@ load_dotenv()
 
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
+from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain_core.documents import Document
@@ -381,29 +384,26 @@ def ingest_documents():
         print("⚠️ No new or updated text chunks gathered to index.")
         return
 
-    # --- STABILIZED FAISS WORKSPACE INDEX HANDLING ---
-    faiss_dir = "vectorstore"
-    faiss_file = os.path.join(faiss_dir, "index.faiss")
-    
-    if os.path.exists(faiss_dir) and os.path.exists(faiss_file):
-        print("💾 Loading existing FAISS index for synchronization...")
-        vectorstore = FAISS.load_local(faiss_dir, embeddings, allow_dangerous_deserialization=True)
-    else:
-        print("✨ Building fresh vector footprint pipeline...")
-        first_chunk = all_chunks.pop(0)
-        vectorstore = FAISS.from_documents([first_chunk], embeddings)
+    # --- CHROMADB WORKSPACE INDEX HANDLING ---
+    chroma_client = chromadb.HttpClient(host="localhost", port=8000)
+    print("💾 Connecting to ChromaDB server for synchronization...")
+    vectorstore = Chroma(
+        client=chroma_client,
+        collection_name="rag_documents",
+        embedding_function=embeddings,
+    )
 
     print(f"🔀 Running parallel deduplication for {len(all_chunks)} incoming chunks...")
-    
+
     try:
         sync_stats = index(
             all_chunks,
             record_manager,
             vectorstore,
-            cleanup="incremental",  
+            cleanup="incremental",
             source_id_key="source"
         )
-        
+
         print(f"📊 Synchronization Report: {sync_stats}")
         print(f"\n{'='*80}")
         print(f"✅ INGESTION SUMMARY")
@@ -413,27 +413,27 @@ def ingest_documents():
         print(f"🗑️  Deleted: {sync_stats.get('num_deleted', 0)} old chunks")
         print(f"📊 Updated: {sync_stats.get('num_updated', 0)} chunks")
         print(f"{'='*80}\n")
-        
+
     except ValueError as val_err:
         print(f"⚠️ Index Sync Desynchronization Detected: ({val_err})")
         print("🔄 Performing automatic index reconciliation rebuild...")
-        
-        # Clear record_manager's tracking state so it doesn't reference
-        # chunks/sources that may no longer match the rebuilt FAISS index.
+
         try:
             record_manager.delete_keys(record_manager.list_keys())
             print("🗑️ Cleared record manager tracking state (was at risk of desync).")
         except Exception as rm_err:
             print(f"⚠️ Could not clear record manager cleanly: {rm_err}")
-        
-        vectorstore = FAISS.from_documents(all_chunks, embeddings)
+
+        vectorstore.delete_collection()
+        vectorstore = Chroma.from_documents(
+            all_chunks, embeddings,
+            client=chroma_client,
+            collection_name="rag_documents",
+        )
         print("✅ Vector database re-indexed from this run's chunks only.")
         print("⚠️ NOTE: This was a partial recovery — only chunks processed in this run are indexed.")
-        print("⚠️ Files that were already indexed in prior runs and were NOT re-uploaded this time")
-        print("⚠️ may be MISSING from the new index. Consider re-uploading all documents to be safe.")
 
-    vectorstore.save_local(faiss_dir)
-    print("✅ Local FAISS index updated successfully!")
+    print("✅ ChromaDB collection updated successfully!")
 
 if __name__ == "__main__":
     ingest_documents()
