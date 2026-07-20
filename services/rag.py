@@ -2,6 +2,7 @@ import re
 import json
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor 
 from langchain_community.vectorstores import FAISS
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
@@ -97,18 +98,18 @@ QUESTION: {question}
     return [question]
 
 def rag_fusion_retrieve(question, n_variations=3):
-    """
-    RAG Fusion: retrieve using the original question PLUS n_variations
-    reformulated versions, then fuse everything with RRF. Replaces
-    hybrid_retrieve() as the retrieval step inside get_answer().
-    """
     variations = generate_query_variations(question, n=n_variations)
     from services.vectorstore import bm25_retriever, dense_retriever
 
+    def retrieve_both(q):
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            bm25_future = executor.submit(bm25_retriever.invoke, q)
+            dense_future = executor.submit(dense_retriever.invoke, q)
+            return bm25_future.result(), dense_future.result()
+
     all_doc_lists = []
     for q in variations:
-        bm25_docs = bm25_retriever.invoke(q)
-        dense_docs = dense_retriever.invoke(q)
+        bm25_docs, dense_docs = retrieve_both(q)
         all_doc_lists.append(bm25_docs)
         all_doc_lists.append(dense_docs)
 
