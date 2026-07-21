@@ -1,6 +1,7 @@
 import json
 import time
 import os
+import threading
 from dotenv import load_dotenv
 from kafka_handler import get_consumer
 
@@ -32,6 +33,17 @@ if USE_LANGGRAPH:
 
 
 REDIS_RESULT_TTL = 300
+
+def listen_for_vectorstore_updates():
+    pubsub = redis_client.pubsub()
+    pubsub.subscribe("vectorstore_updates")
+    logger.info("vectorstore_reload_listener_started")
+    for message in pubsub.listen():
+        if message["type"] == "message":
+            with app.app_context():
+                from services.vectorstore import initialize_vectorstore
+                initialize_vectorstore()
+                logger.info("vectorstore_reloaded_via_signal")
 
 def answer_question(question, session_id, user_id):
     """
@@ -231,6 +243,10 @@ def main():
         from services.vectorstore import initialize_vectorstore
         initialize_vectorstore()
         logger.info("vectorstore_initialized")
+
+    reload_thread = threading.Thread(target=listen_for_vectorstore_updates, daemon=True)
+    reload_thread.start()
+    logger.info("vectorstore_reload_thread_started")
 
     consumer = get_consumer(group_id="rag-worker-group")
 

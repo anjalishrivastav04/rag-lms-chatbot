@@ -268,8 +268,17 @@ def is_casual_query(question):
     return False
 
 def is_list_documents_query(question):
-    patterns = r"\b(list|show|what|which).*(document|file|pdf)s?\b"
-    return bool(re.search(patterns, question.lower().strip()))
+    """Detects requests to enumerate available documents (e.g. 'what
+    documents do you have', 'list the files'), NOT questions about
+    content within a specific document (e.g. 'what does the ai document
+    say about...', which must still go through retrieval)."""
+    q = question.lower().strip()
+    patterns = (
+        r"\b(list|show)\s+(me\s+)?(all\s+)?(the\s+)?(uploaded\s+)?(documents?|files?|pdfs?)\b"
+        r"|\b(what|which)\s+(documents?|files?|pdfs?)\s+"
+        r"(do you have|are there|are available|have (i|you)|exist|were uploaded)\b"
+    )
+    return bool(re.search(patterns, q))
 
 def decompose_question(question):
     if is_casual_query(question) or is_list_documents_query(question):
