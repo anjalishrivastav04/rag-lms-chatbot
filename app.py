@@ -152,16 +152,18 @@ if __name__ == "__main__":
             admin_user = User.query.filter_by(is_admin=True).first()
             if admin_user:
                 synced = 0
+                newly_synced_filenames = []
                 for filename in os.listdir(UPLOAD_FOLDER):
-                    if '.' in filename and filename.rsplit('.', 1)[1].lower() in {"pdf", "txt", "jpg", "jpeg", "png", "bmp", "gif"}:
+                    if '.' in filename and filename.rsplit('.', 1)[1].lower() == "pdf":
                         filepath = os.path.join(UPLOAD_FOLDER, filename)
                         if os.path.isfile(filepath) and not ProcessedFile.query.filter_by(filename=filename).first():
                             save_processed_file_info(admin_user.id, filename, filepath, chunk_count=0)
                             synced += 1
+                            newly_synced_filenames.append(filename)
                 if synced > 0:
-                    print(f"✅ Synced {synced} documents")
-                    ingest_documents()
+                    print(f"✅ Synced {synced} documents to DB (registration only — "
+                          f"ingestion is handled by ingest_worker.py, not startup)")    
 
     from services.vectorstore import initialize_vectorstore
     initialize_vectorstore()
-    app.run(debug=True)
+    app.run(debug=True, use_reloader=False)

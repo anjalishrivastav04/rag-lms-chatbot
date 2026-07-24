@@ -441,7 +441,27 @@
   <script>
     let allFiles = [];
 
-    window.addEventListener('load', loadDocuments);
+    // ============================================================
+    // ✅ CSRF TOKEN HELPER (required — Flask-WTF CSRFProtect is active
+    // globally, and DELETE requests without a valid token get rejected
+    // with an HTML error page instead of JSON, which breaks response.json())
+    // ============================================================
+    let csrfToken = "";
+
+    async function fetchCsrfToken() {
+      try {
+        const res = await fetch('/csrf-token');
+        const data = await res.json();
+        csrfToken = data.csrf_token;
+      } catch (e) {
+        console.error('CSRF token fetch error:', e);
+      }
+    }
+
+    window.addEventListener('load', async () => {
+      await fetchCsrfToken();
+      loadDocuments();
+    });
 
     async function loadDocuments() {
       document.getElementById('loadingState').style.display = 'block';
@@ -584,7 +604,8 @@
 
       try {
         const response = await fetch(`/documents/${encodeURIComponent(filename)}`, {
-          method: 'DELETE'
+          method: 'DELETE',
+          headers: { "X-CSRFToken": csrfToken }
         });
 
         const data = await response.json();

@@ -1,6 +1,7 @@
 import json
 import time
 import os
+import threading
 from dotenv import load_dotenv
 from kafka_handler import get_consumer
 

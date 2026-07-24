@@ -33,3 +33,5 @@ documents/
 # Logs
 *.log
 logs/
+chroma_data/
+chroma_vectorstore/

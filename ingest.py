@@ -1,24 +1,26 @@
 import os
 import re
-import glob
+import hashlib
 import redis
+import fitz
 import uuid
 from dotenv import load_dotenv
+import chromadb
+from langchain_chroma import Chroma
 from graph_handler import build_graph_from_chunks, delete_graph_for_file
+from vision_handler import analyze_image, get_image_caption, classify_image_type
 
 # 🚨 CRITICAL: Load environment variables BEFORE initializing any LangChain or local vision tools
 load_dotenv()
 
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain_core.documents import Document
-from ocr_handler import save_ocr_text_to_file, extract_text_from_image  
+from ocr_handler import save_ocr_text_to_file, extract_text_from_image
 from langchain_classic.indexes import SQLRecordManager, index
-from pdf2image import convert_from_path  
-from vision_handler import analyze_image  # 👈 Safe to import now that environment is active!
+from pdf2image import convert_from_path
 
 # --- SYSTEM INTEGRATION PATHS ---
 # 🌟 Verified absolute path to your compiled OneDrive desktop binaries
@@ -101,30 +103,136 @@ Reply with ONLY the strategy name in lowercase, nothing else."""
     return method if method in valid else "recursive"
 
 # -------------------------------------------
-# CHUNKING METHOD DETECTOR
+# CHUNKING METHOD DETECTOR (issue #5 — Redis -> Postgres -> statistical -> LLM)
 # -------------------------------------------
 def detect_chunking_method(content):
     file_hash = hashlib.md5(content.encode()).hexdigest()
     cache_key = f"chunking:{file_hash}"
 
+    # 1. Check Redis FIRST — fast path, no DB hit
     cached = redis_client.get(cache_key)
     if cached:
         print(f"⚡ Chunking method from Redis cache: {cached}")
         return cached
 
+    # 2. Redis missed — NOW check Postgres
+    from models.models import ChunkingDecision
+    from extensions import db
+    existing = ChunkingDecision.query.get(file_hash)
+    if existing:
+        print(f"🗄️ Chunking method from Postgres cache: {existing.method}")
+        redis_client.set(cache_key, existing.method)   # repopulate Redis
+        return existing.method
+
+    # 3. Both missed — compute fresh
     method, confidence = statistical_analysis(content)
     print(f"📊 Statistical result: {method} (confidence: {confidence:.0%})")
 
     if confidence < 0.75:
         print(f"🧠 Low confidence — asking LLM...")
         method = ask_llm_for_chunking(content[:2000])
+        confidence = None  # LLM-picked method has no statistical confidence score
         print(f"🤖 LLM recommended: {method}")
     else:
         print(f"✅ High confidence — using: {method}")
 
+    # 4. Write-through to both caches — Redis for speed, Postgres for durability
     redis_client.set(cache_key, method)
     print(f"💾 Chunking decision cached in Redis.")
+
+    try:
+        decision = ChunkingDecision(content_hash=file_hash, method=method, confidence=confidence)
+        db.session.merge(decision)  # upsert — safe if this hash was already written concurrently
+        db.session.commit()
+        print(f"🗄️ Chunking decision persisted to Postgres.")
+    except Exception as e:
+        db.session.rollback()
+        print(f"⚠️ Failed to persist chunking decision to Postgres: {e}")
+
     return method
+
+# -------------------------------------------
+# EMBEDDED IMAGE OCR (issue #3 — hybrid PDF pages)
+# -------------------------------------------
+def extract_embedded_image_text(pdf_doc, page_num, main_text):
+    """
+    Finds embedded images on a given page (0-indexed) of an ALREADY-OPEN
+    fitz document, runs OCR on each, and returns their text — skipping
+    tiny/decorative images, low-confidence OCR noise, and text already
+    substantially present in the page's main extracted text. Images that
+    OCR can't sufficiently explain (diagrams, flowcharts) also get a
+    VLM-generated caption appended, via vision_handler.get_image_caption().
+    """
+    ocr_blocks = []
+    MIN_OCR_CONFIDENCE = 0.40  # confidence is a 0-1 fraction, not a percentage
+
+    try:
+        page = pdf_doc[page_num]
+        image_list = page.get_images(full=True)
+
+        for img_index, img_info in enumerate(image_list):
+            xref = img_info[0]
+            try:
+                base_image = pdf_doc.extract_image(xref)
+                image_bytes = base_image["image"]
+                image_ext = base_image["ext"]
+
+                if len(image_bytes) < 5000:
+                    continue
+
+                temp_img_path = f"documents/temp_embedded_{page_num + 1}_{img_index}.{image_ext}"
+                with open(temp_img_path, "wb") as f:
+                    f.write(image_bytes)
+
+                try:
+                    ocr_text, confidence = extract_text_from_image(temp_img_path)
+                finally:
+                    if os.path.exists(temp_img_path):
+                        os.remove(temp_img_path)
+
+                if not ocr_text or not ocr_text.strip():
+                    continue
+
+                # Skip low-confidence OCR — usually seals, watermarks,
+                # or logos where OCR guesses garbage text.
+                if confidence is not None and confidence < MIN_OCR_CONFIDENCE:
+                    continue
+
+                ocr_words = set(re.findall(r'\w+', ocr_text.lower()))
+                main_words = set(re.findall(r'\w+', main_text.lower()))
+                if ocr_words:
+                    overlap = len(ocr_words & main_words) / len(ocr_words)
+                    if overlap > 0.7:
+                        continue
+
+                # --- NEW: classify + optionally caption via VLM ---
+                image_type = classify_image_type(ocr_text, confidence)
+
+                if image_type == "diagram":
+                    print(f"🖼️ Page {page_num + 1}, image {img_index}: classified as diagram — requesting VLM caption...")
+                    temp_caption_path = f"documents/temp_caption_{page_num + 1}_{img_index}.{image_ext}"
+                    with open(temp_caption_path, "wb") as f:
+                        f.write(image_bytes)
+                    try:
+                        caption = get_image_caption(temp_caption_path)
+                        if caption and caption.strip():
+                            ocr_text = ocr_text.strip() + f"\n[IMAGE DESCRIPTION]: {caption.strip()}"
+                    finally:
+                        if os.path.exists(temp_caption_path):
+                            os.remove(temp_caption_path)
+                else:
+                    print(f"📝 Page {page_num + 1}, image {img_index}: classified as text-dense — OCR sufficient, skipping VLM call.")
+                # --- END NEW ---
+
+                ocr_blocks.append(ocr_text.strip())
+
+            except Exception as img_err:
+                print(f"⚠️ Could not process embedded image {img_index} on page {page_num + 1}: {img_err}")
+                continue
+    except Exception as e:
+        print(f"⚠️ Could not process embedded images for page {page_num + 1}: {e}")
+
+    return ocr_blocks
 
 # -------------------------------------------
 # GET SPLITTER
@@ -169,109 +277,96 @@ def get_splitter(method):
         )
 
 # -------------------------------------------
-# MAIN INGEST FUNCTION
+# FILE VALIDATION (issue #2 — PDF only)
 # -------------------------------------------
-def ingest_documents():
+def check_document(file_name):
+    if ".pdf" not in file_name:
+        print(f"⚠️ Invalid file type: {file_name}")
+        return False
+    return True
+
+# -------------------------------------------
+# MAIN INGEST FUNCTION (issue #4 — single file, no Redis-driven duplicate detection)
+# -------------------------------------------
+def ingest_documents(file_name):
+    if not check_document(file_name):
+        return {}
+
+    filepath = os.path.join("documents", file_name)
+    if not os.path.exists(filepath):
+        print(f"⚠️ File does not exist: {filepath}")
+        return {}
+
     all_chunks = []
-
-    file_paths = (
-        glob.glob("documents/*.txt") + 
-        glob.glob("documents/*.pdf") + 
-        glob.glob("documents/*.jpg") + 
-        glob.glob("documents/*.jpeg") + 
-        glob.glob("documents/*.png") + 
-        glob.glob("documents/*.bmp") + 
-        glob.glob("documents/*.gif")
-    )
-
-    if not file_paths:
-        print("📁 No documents found in /documents folder.")
-        return
+    file_chunk_counts = {}
+    file_paths = [filepath]
 
     print(f"\n{'='*80}")
-    print(f"🔍 INCREMENTAL INGESTION REPORT")
+    print(f"🔍 INGESTION REPORT")
     print(f"{'='*80}")
-    print(f"📊 Total files to check: {len(file_paths)}\n")
-
-    any_processed = False
+    print(f"📊 Processing: {file_name}\n")
 
     for path in file_paths:
         filename = os.path.basename(path)
-        filename_lower = filename.lower()
-        
-        # Look up file_id from Redis (saved during upload)
+
         file_id_key = f"file_id:{filename}"
         file_id = redis_client.get(file_id_key) or str(uuid.uuid4())
+        redis_client.set(file_id_key, file_id)
         print(f"🔑 File ID for {filename}: {file_id}")
-        # ✅ END ADD
-        
-        if filename_lower.endswith('_ocr.txt') or filename_lower.endswith('_vision.txt'):
-            print(f"⏭️  SKIPPED: {filename} (Temporary derivative file)\n")
-            continue
-            
-        # -------------------------------------------------------------
-        # 🧠 EARLY CACHE CHECK: Stop processing if the file is unchanged
-        # -------------------------------------------------------------
-        try:
-            stat = os.stat(path)
-            file_stat_sig = f"{stat.st_mtime_ns}:{stat.st_size}"
-            
-            is_already_indexed = redis_client.get(f"fastpass_hash:{filename}")
-            
-            if is_already_indexed == file_stat_sig:
-                print(f"⚡ FAST-PASS: {filename} has not changed. Skipping extraction and vision analysis entirely!\n")
-                continue
-        except Exception as hash_err:
-            print(f"⚠️ Pre-computation skip check warning: {hash_err}")
-        # -------------------------------------------------------------
 
         print(f"📄 PROCESSING: {filename}")
-        any_processed = True
         docs = []
 
         try:
-            # 1. Handle Text Files
-            if filename_lower.endswith('.txt'):
-                loader = TextLoader(path, encoding="utf-8")
-                docs = loader.load()
-                
-            # 2. Handle PDF Files (Smart Hybrid with Spacing Defect Detection)
-            elif filename_lower.endswith('.pdf'):
-                print(f"🔍 Loading PDF layout layers...")
-                loader = PyPDFLoader(path)
-                raw_pdf_docs = loader.load()
-                
+            print(f"🔍 Loading PDF layout layers...")
+            loader = PyPDFLoader(path)
+            raw_pdf_docs = loader.load()
+
+            fitz_doc = None
+            try:
+                fitz_doc = fitz.open(path)
+
                 for page_num, doc in enumerate(raw_pdf_docs):
                     text_content = doc.page_content.strip()
-                    
                     clean_char_count = len(re.sub(r'\s+', '', text_content))
-                    
+
                     is_spaced_out = False
                     if len(text_content) > 0:
                         single_letters = len(re.findall(r'\b[a-zA-Z]\b', text_content))
                         total_words = max(len(text_content.split()), 1)
                         if (single_letters / total_words) > 0.40:
                             is_spaced_out = True
-                    
+
                     if clean_char_count > 30 and not is_spaced_out:
+                        # Good selectable text — but may ALSO contain embedded
+                        # images with their own text (screenshots, scanned
+                        # signatures, diagrams, tables, etc.)
+                        embedded_ocr_blocks = extract_embedded_image_text(fitz_doc, page_num, text_content)
+
+                        if embedded_ocr_blocks:
+                            print(f"🖼️ Page {page_num + 1}: found {len(embedded_ocr_blocks)} embedded image(s) with extractable text — merging.")
+                            doc.page_content = text_content + "\n\n=== TEXT FROM EMBEDDED IMAGES ===\n" + "\n\n".join(embedded_ocr_blocks)
+                            doc.metadata["has_embedded_image_text"] = True
+                            doc.metadata["has_image_caption"] = "[IMAGE DESCRIPTION]" in doc.page_content
+
                         docs.append(doc)
                     else:
                         print(f"📸 Page {page_num + 1} flagged as image scan or broken layout. Initiating OCR fallback...")
                         try:
                             # 🌟 PASSED POPPLER BINARIES PATH DIRECTLY HERE:
                             images = convert_from_path(
-                                path, 
-                                first_page=page_num + 1, 
-                                last_page=page_num + 1, 
+                                path,
+                                first_page=page_num + 1,
+                                last_page=page_num + 1,
                                 dpi=300,
                                 poppler_path=POPPLER_PATH
                             )
                             if images:
                                 temp_img_path = f"documents/temp_page_{page_num + 1}.jpg"
                                 images[0].save(temp_img_path, 'JPEG')
-                                
+
                                 ocr_text, confidence = extract_text_from_image(temp_img_path)
-                                
+
                                 if ocr_text and ocr_text.strip():
                                     print(f"✨ Successfully extracted clean text from PDF Page {page_num + 1}!")
                                     docs.append(Document(
@@ -286,7 +381,7 @@ def ingest_documents():
                                     doc.metadata["degraded"] = True
                                     doc.metadata["degraded_reason"] = "ocr_empty"
                                     docs.append(doc)
-                                
+
                                 if os.path.exists(temp_img_path):
                                     os.remove(temp_img_path)
                             else:
@@ -299,42 +394,9 @@ def ingest_documents():
                             doc.metadata["degraded"] = True
                             doc.metadata["degraded_reason"] = f"ocr_exception: {pdf_img_err}"
                             docs.append(doc)
-
-            # 3. Handle Pure Image Files with Toggle Configuration
-            elif any(filename_lower.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.gif']):
-                vision_description = "Visual descriptions disabled via system config parameters."
-                
-                if os.getenv("USE_GOOGLE_VISION", "False").lower() == "true":
-                    print(f"🖼️ Image detected - attempting analysis with local VLM engine...")
-                    try:
-                        vision_description = analyze_image(path)
-                    except Exception as vision_err:
-                        print(f"⚠️ Local VLM parsing failed. Bypassing structural description...")
-                        vision_description = "Visual workspace descriptions unavailable. Falling back to clean OCR."
-                else:
-                    print(f"⚙️ Skipping VLM engine (USE_GOOGLE_VISION=False). Running local OCR framework pipeline...")
-
-                print(f"📸 Running OCR for handwritten text...")
-                output_txt_path, ocr_error = save_ocr_text_to_file(path)
-                
-                combined_text = f"=== IMAGE ANALYSIS SUMMARY ===\n{vision_description}\n\n"
-                
-                if output_txt_path and os.path.exists(output_txt_path):
-                    with open(output_txt_path, 'r', encoding='utf-8') as f:
-                        ocr_text = f.read()
-                    combined_text += f"=== OCR EXTRACTED TEXT ===\n{ocr_text}"
-                    
-                    with open(output_txt_path, 'w', encoding='utf-8') as f:
-                        f.write(combined_text)
-                    
-                    loader = TextLoader(output_txt_path, encoding="utf-8")
-                    docs = loader.load()
-                else:
-                    temp_vision_path = f"documents/{os.path.splitext(filename)[0]}_vision.txt"
-                    with open(temp_vision_path, 'w', encoding='utf-8') as f:
-                        f.write(combined_text)
-                    loader = TextLoader(temp_vision_path, encoding="utf-8")
-                    docs = loader.load()
+            finally:
+                if fitz_doc is not None:
+                    fitz_doc.close()
 
             if not docs:
                 print(f"⚠️  No content extracted from {filename}\n")
@@ -344,19 +406,27 @@ def ingest_documents():
             if not content.strip():
                 print(f"⚠️  Empty content after processing {filename}\n")
                 continue
-                
+
             method = detect_chunking_method(content)
             splitter = get_splitter(method)
             chunks = splitter.split_documents(docs)
 
+            # issue #6 — derive document title (embedded PDF title, else filename)
+            raw_title = docs[0].metadata.get("title", "") if docs else ""
+            document_title = raw_title.strip() if raw_title and raw_title.strip() else filename.rsplit('.', 1)[0]
+
             for i, chunk in enumerate(chunks):
-                chunk.metadata["source"] = filename 
-                chunk.metadata["file_id"] = file_id 
+                chunk.metadata["source"] = filename
+                chunk.metadata["file_id"] = file_id
                 chunk.metadata["filetype"] = filename.rsplit('.', 1)[1].lower()
                 chunk.metadata["chunk_index"] = i
                 chunk.metadata["chunking_method"] = method
+                chunk.metadata["title"] = document_title       # issue #6
+                chunk.metadata["category"] = "cybersecurity"   # issue #6
+                chunk.metadata["status"] = "active"             # issue #1 + #6
 
             all_chunks.extend(chunks)
+            file_chunk_counts[filename] = len(chunks)
             print(f"   ... ADDED: {len(chunks)} chunks\n")
 
             build_graph_from_chunks(chunks, filename)
@@ -365,45 +435,33 @@ def ingest_documents():
             from redis_helpers import save_source_index
             chunk_ids = [chunk.metadata.get("chunk_index", i) for i, chunk in enumerate(chunks)]
             save_source_index(filename, chunk_ids)
-            
-            # Cache the successful hash state mapping inside Redis
-            redis_client.set(f"fastpass_hash:{filename}", file_stat_sig)
-            
+
         except Exception as e:
             print(f"❌ Failed processing {filename}: {str(e)}\n")
             continue
 
-    if not any_processed:
-        print("⚡ All files verified via Fast-Pass checksum profiles. Vector space index is up to date!")
-        return
-
     if not all_chunks:
         print("⚠️ No new or updated text chunks gathered to index.")
-        return
+        return file_chunk_counts
 
-    # --- STABILIZED FAISS WORKSPACE INDEX HANDLING ---
-    faiss_dir = "vectorstore"
-    faiss_file = os.path.join(faiss_dir, "index.faiss")
-    
-    if os.path.exists(faiss_dir) and os.path.exists(faiss_file):
-        print("💾 Loading existing FAISS index for synchronization...")
-        vectorstore = FAISS.load_local(faiss_dir, embeddings, allow_dangerous_deserialization=True)
-    else:
-        print("✨ Building fresh vector footprint pipeline...")
-        first_chunk = all_chunks.pop(0)
-        vectorstore = FAISS.from_documents([first_chunk], embeddings)
-
+    # --- CHROMADB WORKSPACE INDEX HANDLING (issue #1) ---
+    chroma_client = chromadb.HttpClient(host="localhost", port=8000)
+    print("💾 Connecting to ChromaDB server for synchronization...")
+    vectorstore = Chroma(
+        client=chroma_client,
+        collection_name="rag_documents",
+        embedding_function=embeddings,
+    )
     print(f"🔀 Running parallel deduplication for {len(all_chunks)} incoming chunks...")
-    
+
     try:
         sync_stats = index(
             all_chunks,
             record_manager,
             vectorstore,
-            cleanup="incremental",  
+            cleanup="incremental",
             source_id_key="source"
         )
-        
         print(f"📊 Synchronization Report: {sync_stats}")
         print(f"\n{'='*80}")
         print(f"✅ INGESTION SUMMARY")
@@ -413,27 +471,45 @@ def ingest_documents():
         print(f"🗑️  Deleted: {sync_stats.get('num_deleted', 0)} old chunks")
         print(f"📊 Updated: {sync_stats.get('num_updated', 0)} chunks")
         print(f"{'='*80}\n")
-        
+
     except ValueError as val_err:
         print(f"⚠️ Index Sync Desynchronization Detected: ({val_err})")
-        print("🔄 Performing automatic index reconciliation rebuild...")
-        
-        # Clear record_manager's tracking state so it doesn't reference
-        # chunks/sources that may no longer match the rebuilt FAISS index.
-        try:
-            record_manager.delete_keys(record_manager.list_keys())
-            print("🗑️ Cleared record manager tracking state (was at risk of desync).")
-        except Exception as rm_err:
-            print(f"⚠️ Could not clear record manager cleanly: {rm_err}")
-        
-        vectorstore = FAISS.from_documents(all_chunks, embeddings)
-        print("✅ Vector database re-indexed from this run's chunks only.")
-        print("⚠️ NOTE: This was a partial recovery — only chunks processed in this run are indexed.")
-        print("⚠️ Files that were already indexed in prior runs and were NOT re-uploaded this time")
-        print("⚠️ may be MISSING from the new index. Consider re-uploading all documents to be safe.")
 
-    vectorstore.save_local(faiss_dir)
-    print("✅ Local FAISS index updated successfully!")
+        if os.getenv("FORCE_REBUILD_ON_DESYNC", "false").lower() == "true":
+            print("🚨 FORCE_REBUILD_ON_DESYNC is set — proceeding with full collection wipe + rebuild.")
+            try:
+                record_manager.delete_keys(record_manager.list_keys())
+                print("🗑️ Cleared record manager tracking state (was at risk of desync).")
+            except Exception as rm_err:
+                print(f"⚠️ Could not clear record manager cleanly: {rm_err}")
+
+            vectorstore.delete_collection()
+            vectorstore = Chroma.from_documents(
+                all_chunks, embeddings,
+                client=chroma_client,
+                collection_name="rag_documents",
+            )   
+            print("✅ Vector database re-indexed from this run's chunks only (FORCED).")
+        else:
+            print("❌ Ingestion for this file was NOT completed due to sync desync.")
+            print("❌ No data was deleted. To force a full rebuild (WARNING: deletes ALL")
+            print("❌ previously ingested documents), set FORCE_REBUILD_ON_DESYNC=true in .env and re-run.")
+            return file_chunk_counts
+
+    print("✅ ChromaDB collection updated successfully!")
+
+    from kafka_handler import send_vectorstore_update
+    send_vectorstore_update(file_name)
+
+    return file_chunk_counts
+
 
 if __name__ == "__main__":
-    ingest_documents()
+    import sys
+    from app import app  # reuse the existing Flask app instance for DB context
+
+    with app.app_context():
+        if len(sys.argv) > 1:
+            ingest_documents(sys.argv[1])
+        else:
+            print("Usage: python ingest.py <filename.pdf>")

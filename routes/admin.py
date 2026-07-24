@@ -11,11 +11,10 @@ from services.cache import (
     delete_source_index
 )
 from services.rag import ingest_feedback_to_vectorstore
-from services.vectorstore import reload_vectorstore
+from services.vectorstore import reload_vectorstore, archive_file_chunks
 from ingest import ingest_documents
 from graph_handler import delete_graph_for_file
 from config import UPLOAD_FOLDER, ALLOWED_EXTENSIONS, OCR_SUPPORTED, REDIS_TTL
-from langchain_community.vectorstores import FAISS
 from extensions import embeddings
 
 admin_bp = Blueprint('admin', __name__)
@@ -64,8 +63,9 @@ def upload_file():
     file = request.files["file"]
     if file.filename == "":
         return jsonify({"success": False, "message": "No file selected."})
+    print(f"🔍 DEBUG: filename={file.filename}, ALLOWED_EXTENSIONS={ALLOWED_EXTENSIONS}")
     if not allowed_file(file.filename):
-        return jsonify({"success": False, "message": "Only PDF, TXT, and image files allowed!"})
+        return jsonify({"success": False, "message": "Only PDF files are allowed!"})
     try:
         filename = secure_filename(file.filename)
         filepath = os.path.join(UPLOAD_FOLDER, filename)
@@ -84,13 +84,38 @@ def upload_file():
                 return jsonify({"success": False, "message": f"OCR failed: {error}"})
             filename = os.path.basename(ocr_path)
             filepath = os.path.join(UPLOAD_FOLDER, filename)
-        ingest_documents()
-        reload_vectorstore()
-        save_processed_file_info(user_id, filename, filepath, chunk_count=1)
+
+        # ✅ Publish to Kafka instead of processing inline. A separate
+        # ingest_worker.py process pool handles it, so this request
+        # returns immediately — 10 simultaneous uploads don't queue
+        # behind each other, each gets a real OS process.
+        from kafka_handler import send_ingestion_request
+        request_id = send_ingestion_request(user_id, filename, filepath)
+
+        if request_id is None:
+            # Kafka unavailable — fall back to the old synchronous path
+            chunk_counts = ingest_documents(filename)
+            if not chunk_counts:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                return jsonify({
+                    "success": False,
+                    "message": f"❌ '{filename}' could not be processed. Only valid PDF files are supported."
+                })
+            reload_vectorstore()
+            real_count = chunk_counts.get(filename, 0)
+            save_processed_file_info(user_id, filename, filepath, chunk_count=real_count)
+            return jsonify({
+                "success": True,
+                "message": f"✅ '{filename}' uploaded and processed successfully!",
+                "done": True
+            })
+
         return jsonify({
             "success": True,
-            "message": f"✅ '{filename}' uploaded and processed successfully!",
-            "is_ocr": file_ext in OCR_SUPPORTED
+            "message": f"📤 '{filename}' queued for processing...",
+            "request_id": request_id,
+            "done": False
         })
     except Exception as e:
         return jsonify({"success": False, "message": f"Error: {str(e)}"})
@@ -118,6 +143,15 @@ def list_documents():
     except Exception as e:
         return jsonify({"success": False, "message": str(e)})
 
+@admin_bp.route("/upload/result/<request_id>", methods=["GET"])
+@admin_required
+def upload_result(request_id):
+    import json
+    result_json = redis_client.get(f"ingest_result:{request_id}")
+    if result_json is None:
+        return jsonify({"done": False})
+    result = json.loads(result_json)
+    return jsonify({"done": True, **result})
 
 @admin_bp.route("/documents/<filename>", methods=["DELETE"])
 @admin_required
@@ -139,8 +173,9 @@ def delete_document(filename):
                 os.remove(fp)
                 print(f"🗑️ Deleted file: {fp}")
 
+        stored_file_id = file_record.file_id
+
         db.session.delete(file_record)
-        add_to_blacklist(filename)
 
         try:
             delete_graph_for_file(filename)
@@ -149,12 +184,15 @@ def delete_document(filename):
 
         delete_source_index(filename)
 
+        # ✅ No longer flushdb() — that wiped chunking decisions, semantic cache,
+        # and rate limits for EVERY document, not just the one being deleted.
+        # Chunking decisions are content-hash-keyed, so they're unaffected by
+        # deleting a specific filename anyway — only blacklist this file.
         try:
-            redis_client.flushdb()
             add_to_blacklist(filename)
-            print("🗑️ Cleared ALL Redis cache and re-added blacklist entry")
+            print("🗑️ Added file to blacklist")
         except Exception as e:
-            print(f"⚠️ Redis flush warning: {e}")
+            print(f"⚠️ Blacklist warning: {e}")
 
         try:
             SemanticCacheRecord.query.delete()
@@ -171,38 +209,12 @@ def delete_document(filename):
 
         db.session.commit()
 
+        # ✅ Archive chunks in ChromaDB instead of manually walking a FAISS index
         try:
-            if os.path.exists("vectorstore"):
-                vs = FAISS.load_local("vectorstore", embeddings,
-                                      allow_dangerous_deserialization=True)
-                base_name = filename.rsplit('.', 1)[0].lower()
-                ids_to_delete = []
-                if chunk_ids:
-                    chunk_ids_int = [int(cid) for cid in chunk_ids if str(cid).isdigit()]
-                    for doc_id, doc_idx in vs.index_to_docstore_id.items():
-                        doc = vs.docstore.search(doc_idx)
-                        if doc:
-                            chunk_index = doc.metadata.get("chunk_index")
-                            source = doc.metadata.get("source", "").lower()
-                            if chunk_index in chunk_ids_int and base_name in source:
-                                ids_to_delete.append(doc_idx)
-                    if not ids_to_delete:
-                        for doc_id, doc_idx in vs.index_to_docstore_id.items():
-                            doc = vs.docstore.search(doc_idx)
-                            if doc and base_name in doc.metadata.get("source", "").lower():
-                                ids_to_delete.append(doc_idx)
-                else:
-                    for doc_id, doc_idx in vs.index_to_docstore_id.items():
-                        doc = vs.docstore.search(doc_idx)
-                        if doc and base_name in doc.metadata.get("source", "").lower():
-                            ids_to_delete.append(doc_idx)
-
-                if ids_to_delete:
-                    vs.delete(ids_to_delete)
-                    vs.save_local("vectorstore")
-                    print(f"✅ Deleted {len(ids_to_delete)} FAISS chunks for: {filename}")
+            if stored_file_id:
+                archive_file_chunks(stored_file_id)
         except Exception as e:
-            print(f"⚠️ FAISS deletion error: {e}")
+            print(f"⚠️ ChromaDB archive error: {e}")
 
         try:
             if os.path.exists("record_manager_cache.db"):
@@ -212,8 +224,8 @@ def delete_document(filename):
                 base_name = filename.rsplit('.', 1)[0].lower()
                 cursor.execute("""
                     DELETE FROM upsertion_record
-                    WHERE source_id LIKE ? OR source_id LIKE ?
-                    OR source_id LIKE ? OR source_id LIKE ?
+                    WHERE group_id LIKE ? OR group_id LIKE ?
+                    OR group_id LIKE ? OR group_id LIKE ?
                 """, (f"%{filename}%", f"%{base_name}_ocr%",
                       f"%{base_name}_vision%", f"%{base_name}.txt%"))
                 conn.commit()
@@ -222,6 +234,8 @@ def delete_document(filename):
             print(f"⚠️ Record manager cleanup: {e}")
 
         reload_vectorstore()
+        redis_client.publish("vectorstore_updates", "reload")  # ✅ notify worker to reload
+
         return jsonify({
             "success": True,
             "message": f"🗑️ '{filename}' and ALL related cache/data deleted successfully!"
@@ -364,24 +378,21 @@ def remove_feedback(feedback_id):
         source_id = f"admin_feedback_{feedback_id}"
         import services.vectorstore as vs_module
         from langchain_community.retrievers import BM25Retriever
-        from langchain_core.documents import Document
 
         if vs_module.vectorstore:
             vs_module.ALL_DOCS = [doc for doc in vs_module.ALL_DOCS
                                   if doc.metadata.get("source") != source_id]
+            try:
+                matches = vs_module.vectorstore.get(where={"source": source_id}, include=["metadatas"])
+                ids_to_delete = matches.get("ids", [])
+                if ids_to_delete:
+                    vs_module.vectorstore._collection.delete(ids=ids_to_delete)
+                    print(f"✅ Deleted {len(ids_to_delete)} Chroma chunks for feedback source: {source_id}")
+            except Exception as e:
+                print(f"⚠️ Chroma feedback-doc delete error: {e}")
+
             if vs_module.ALL_DOCS:
-                vs_module.vectorstore = FAISS.from_documents(vs_module.ALL_DOCS, embeddings)
-                vs_module.vectorstore.save_local("vectorstore")
-                vs_module.dense_retriever = vs_module.vectorstore.as_retriever(search_kwargs={"k": 6})
                 vs_module.bm25_retriever = BM25Retriever.from_documents(vs_module.ALL_DOCS, k=6)
-            else:
-                dummy_doc = Document(
-                    page_content="No documents uploaded yet.",
-                    metadata={"source": "system", "filetype": "txt", "chunk_index": 0}
-                )
-                vs_module.vectorstore = FAISS.from_documents([dummy_doc], embeddings)
-                vs_module.vectorstore.save_local("vectorstore")
-                vs_module.ALL_DOCS = [dummy_doc]
 
         cache_key = f"rag:{feedback.question.lower().strip()}"
         redis_client.delete(cache_key)
@@ -495,6 +506,15 @@ def save_processed_file_info(user_id, filename, filepath, chunk_count):
         import re as _re
         match = _re.search(r'(_v\d+|_updated|_v\d+_updated)', filename.lower())
         version = match.group(1) if match else "v1"
+
+        # ✅ Use the SAME file_id that ingest.py already generated and
+        # embedded into every chunk's metadata in Chroma — don't let
+        # ProcessedFile's default lambda invent a second, different UUID.
+        # Without this, Postgres and Chroma disagree on file_id, and
+        # delete_document()'s archive_file_chunks() call silently finds
+        # nothing to archive.
+        chroma_file_id = redis_client.get(f"file_id:{filename}")
+
         existing = ProcessedFile.query.filter_by(user_id=user_id, filename=filename).first()
         if existing:
             existing.file_hash = file_hash
@@ -502,17 +522,17 @@ def save_processed_file_info(user_id, filename, filepath, chunk_count):
             existing.chunk_count = chunk_count
             existing.version = version
             existing.processed_at = db.func.now()
+            if chroma_file_id:
+                existing.file_id = chroma_file_id
         else:
             processed = ProcessedFile(
                 user_id=user_id, filename=filename, file_hash=file_hash,
-                file_size=file_size, chunk_count=chunk_count, version=version
+                file_size=file_size, chunk_count=chunk_count, version=version,
+                file_id=chroma_file_id if chroma_file_id else str(__import__('uuid').uuid4())
             )
             db.session.add(processed)
         db.session.commit()
-        record = ProcessedFile.query.filter_by(filename=filename).first()
-        if record:
-            redis_client.set(f"file_id:{filename}", record.file_id)
-        print(f"💾 Saved file info for user {user_id}: {filename}")
+        print(f"💾 Saved file info for user {user_id}: {filename} (file_id={chroma_file_id})")
     except Exception as e:
         db.session.rollback()
         print(f"❌ Error saving file info: {e}")
