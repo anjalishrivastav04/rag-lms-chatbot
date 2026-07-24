@@ -3,6 +3,7 @@ import json
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from langchain_community.vectorstores import FAISS
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from extensions import db, llm, eval_llm, embeddings, embedder
@@ -105,21 +106,14 @@ QUESTION: {question}
     return [question]
 
 def rag_fusion_retrieve(question, n_variations=3):
-    """
-    RAG Fusion: retrieve using the original question PLUS n_variations
-    reformulated versions, then fuse everything with RRF. Replaces
-    hybrid_retrieve() as the retrieval step inside get_answer().
-    """
     variations = generate_query_variations(question, n=n_variations)
     from services.vectorstore import bm25_retriever, dense_retriever
 
-
-    # After:
     all_doc_lists = []
     for q in variations:
-      bm25_docs, dense_docs = retrieve_both(q)
-      all_doc_lists.append(bm25_docs)
-      all_doc_lists.append(dense_docs)
+        bm25_docs, dense_docs = retrieve_both(q)
+        all_doc_lists.append(bm25_docs)
+        all_doc_lists.append(dense_docs)
 
     fused = reciprocal_rank_fusion(all_doc_lists)
     logger.info("rag_fusion_completed", extra={
