@@ -139,8 +139,6 @@ print("✅ Cache cleanup scheduler started (runs every 4 hours)")
 # ============================================================
 
 if __name__ == "__main__":
-    from ingest import ingest_documents
-
     with app.app_context():
         from extensions import db
         from models.models import User, ProcessedFile
@@ -164,17 +162,9 @@ if __name__ == "__main__":
                             synced += 1
 
                 if synced > 0:
-                    print(f"✅ Synced {synced} documents")
-                    chunk_counts = {}
-                    for fname in newly_synced_filenames:
-                        chunk_counts.update(ingest_documents(fname))
-                    for fname in newly_synced_filenames:
-                        real_count = chunk_counts.get(fname, 0)
-                        record = ProcessedFile.query.filter_by(filename=fname).first()
-                        if record:
-                           record.chunk_count = real_count
-                    db.session.commit()
+                    print(f"✅ Synced {synced} documents to DB (registration only — "
+                          f"ingestion is handled by ingest_worker.py, not startup)")
 
     from services.vectorstore import initialize_vectorstore
     initialize_vectorstore()
-    app.run(debug=True)
+    app.run(debug=True, use_reloader=False)

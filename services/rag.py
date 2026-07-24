@@ -2,12 +2,13 @@ import re
 import json
 import time
 import logging
-from concurrent.futures import ThreadPoolExecutor 
+from concurrent.futures import ThreadPoolExecutor
 from langchain_community.vectorstores import FAISS
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from extensions import db, llm, eval_llm, embeddings, embedder
 from models.models import ProcessedFile
+from services.intent_classifier import classify_intent
 from services.cache import (
     check_redis_cache, save_to_redis_cache,
     check_semantic_cache, save_to_semantic_cache,
@@ -73,6 +74,13 @@ def hybrid_retrieve(question):
     dense_docs = dense_retriever.invoke(question)
     return reciprocal_rank_fusion([bm25_docs, dense_docs])
 
+def retrieve_both(q):
+    from services.vectorstore import bm25_retriever, dense_retriever
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        bm25_future = executor.submit(bm25_retriever.invoke, q)
+        dense_future = executor.submit(dense_retriever.invoke, q)
+        return bm25_future.result(), dense_future.result()
+    
 def generate_query_variations(question, n=3):
     """
     RAG Fusion step 1: generate n alternate phrasings of the question so
@@ -100,12 +108,6 @@ QUESTION: {question}
 def rag_fusion_retrieve(question, n_variations=3):
     variations = generate_query_variations(question, n=n_variations)
     from services.vectorstore import bm25_retriever, dense_retriever
-
-    def retrieve_both(q):
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            bm25_future = executor.submit(bm25_retriever.invoke, q)
-            dense_future = executor.submit(dense_retriever.invoke, q)
-            return bm25_future.result(), dense_future.result()
 
     all_doc_lists = []
     for q in variations:
@@ -203,9 +205,11 @@ def rerank_documents(question, docs, top_n=6, max_per_source=3, min_score=0.05):
 # --- QUERY HELPERS ---
 # ============================================================
 def is_personal_statement(question):
-    """Detects simple first-person statements about the user (preferences,
-    facts about themselves) that don't need document retrieval — they're
-    for memory, not the knowledge base."""
+    intent, confidence = classify_intent(question)
+    if intent == "personal_statement" and confidence >= 0.60:
+        return True
+
+    # Fallback to original regex if classifier isn't confident
     personal_patterns = r"\bi\s+(?:actually|also|just|now|really)?\s*(prefer|like|love|hate|am\b|'m\b|work at|live in|study|was born|have a|own a)\b|\bmy\s+(favorite|favourite)\b|\bmy\s+name\s+is\b"
     return bool(re.search(personal_patterns, question.lower().strip()))
 
@@ -247,19 +251,20 @@ def is_confirmation_or_statement(question):
             return True
 
     return False
+
 def is_casual_query(question):
+    intent, confidence = classify_intent(question)
+    if intent == "greeting" and confidence >= 0.60:
+        return True
+
+    # Fallback to original regex logic if classifier isn't confident
     q = question.lower().strip()
-    
-    # ✅ Catch very short inputs BUT not single digits (those are pending part selections)
     if len(q) <= 2 and not q.isdigit():
         return True
-    
-    # ✅ Personal statements and confirmations are casual
     if is_personal_statement(question):
         return True
     if is_confirmation_or_statement(question):
         return True
-    
     greetings = r"\b(hi|hello|hey|greetings|good morning|good afternoon|good evening|wassup|yo|who are you|what is your name|how are you|what can you do|help|thanks|thank you|okay|ok|cool|nice|great|bye|goodbye|what do you mean|clarify|rephrase|tell more|i prefer|more detail)\b"
     if re.search(greetings, q):
         return True
@@ -412,7 +417,6 @@ def save_chat_message(user_id, session_id, role, content, cache_source='NONE', r
         })
 
 def ingest_feedback_to_vectorstore(question, correct_answer, feedback_id):
-    from services.vectorstore import vectorstore, ALL_DOCS, dense_retriever, bm25_retriever
     import services.vectorstore as vs_module
     try:
         content = f"Q: {question}\nA: {correct_answer}"
@@ -423,12 +427,12 @@ def ingest_feedback_to_vectorstore(question, correct_answer, feedback_id):
                 "filetype": "feedback",
                 "chunk_index": 0,
                 "question": question,
-                "is_admin_feedback": True
+                "is_admin_feedback": True,
+                "status": "active"
             }
         )
         if vs_module.vectorstore:
             vs_module.vectorstore.add_documents([doc])
-            vs_module.vectorstore.save_local("vectorstore")
             vs_module.ALL_DOCS.append(doc)
             vs_module.bm25_retriever = BM25Retriever.from_documents(vs_module.ALL_DOCS, k=6)
             cache_response_with_ttl(
@@ -441,12 +445,8 @@ def ingest_feedback_to_vectorstore(question, correct_answer, feedback_id):
             logger.info("feedback_ingested", extra={"feedback_id": feedback_id, "question": question[:50]})
             return True
         else:
-            vs_module.vectorstore = FAISS.from_documents([doc], embeddings)
-            vs_module.vectorstore.save_local("vectorstore")
-            vs_module.ALL_DOCS.append(doc)
-            vs_module.bm25_retriever = BM25Retriever.from_documents(vs_module.ALL_DOCS, k=6)
-            logger.info("vectorstore_created_from_feedback", extra={"feedback_id": feedback_id})
-            return True
+            logger.error("vectorstore_not_initialized", extra={"feedback_id": feedback_id})
+            return False
     except Exception:
         logger.error("feedback_ingestion_failed", exc_info=True, extra={"feedback_id": feedback_id})
         return False
@@ -588,7 +588,7 @@ Answer:"""
         context += doc.page_content[:600] + "\n\n"
 
     alpha = 0.7
-    retrieval_info = f"📊 Retrieved using: RAG Fusion (multi-query) + {int(alpha*100)}% Semantic (FAISS) + {int((1-alpha)*100)}% Keyword (BM25)\n📎 Sources: {', '.join(sources_set)}"
+    retrieval_info = f"📊 Retrieved using: RAG Fusion (multi-query) + {int(alpha*100)}% Semantic (Chroma) + {int((1-alpha)*100)}% Keyword (BM25)\n📎 Sources: {', '.join(sources_set)}"
 
     prompt = f"""You are an expert, smart, helpful document assistant. Your job is to answer questions based strictly on the provided context.
 

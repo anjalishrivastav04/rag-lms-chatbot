@@ -442,6 +442,15 @@
     let allFiles = [];
     window.csrfToken = "";
 
+async function fetchCsrfToken() {
+      try {
+        const res = await fetch('/csrf-token');
+        const data = await res.json();
+        window.csrfToken = data.csrf_token;
+      } catch (e) {
+      console.error('CSRF token fetch error:', e);
+      }
+    }
     async function fetchCsrfToken() {
     try {
       const res = await fetch('/csrf-token');
@@ -451,11 +460,10 @@
     console.error('CSRF token fetch error:', e);
     }
   }
-
     window.addEventListener('load', async () => {
       await fetchCsrfToken();
       loadDocuments();
-  });
+});
 
     async function loadDocuments() {
       document.getElementById('loadingState').style.display = 'block';
@@ -598,9 +606,9 @@
 
       try {
         const response = await fetch(`/documents/${encodeURIComponent(filename)}`, {
-        method: 'DELETE',
-        headers: { "X-CSRFToken": window.csrfToken }
-      });
+method: 'DELETE',
+          headers: { "X-CSRFToken": window.csrfToken }
+        });
 
         const data = await response.json();
 

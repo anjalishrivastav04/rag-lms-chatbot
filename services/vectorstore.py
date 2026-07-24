@@ -141,8 +141,9 @@ def sync_existing_documents():
         if synced_count > 0:
             db.session.commit()
             print(f"✅ Synced {synced_count} pre-existing documents to database")
-            print("🔄 Running ingestion on synced documents...")
-            ingest_documents()
+            for fname in existing_files:
+                if allowed_file(fname):
+                    ingest_documents(fname)
             print("✅ Ingestion complete!")
 
     except Exception as e:
