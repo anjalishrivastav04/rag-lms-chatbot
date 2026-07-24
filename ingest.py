@@ -498,8 +498,11 @@ def ingest_documents(file_name):
 
     print("✅ ChromaDB collection updated successfully!")
 
-    from kafka_handler import send_vectorstore_update
-    send_vectorstore_update(file_name)
+    try:
+        redis_client.publish("vectorstore_updates", "reload")
+        print(f"📢 Published vectorstore reload signal for: {file_name}")
+    except Exception as e:
+        print(f"⚠️ Failed to publish vectorstore reload signal: {e}")
 
     return file_chunk_counts
 

@@ -165,6 +165,7 @@ def delete_document(filename):
 
         chunk_ids = get_chunk_ids_for_file(filename)
         print(f"📋 Pre-fetched {len(chunk_ids)} chunk IDs for: {filename}")
+        file_id_to_archive = file_record.file_id
 
         for fp in [filepath,
                    filepath.rsplit('.', 1)[0] + '_ocr.txt',

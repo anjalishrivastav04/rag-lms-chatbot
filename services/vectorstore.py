@@ -17,7 +17,10 @@ dense_retriever = None
 bm25_retriever = None
 
 def is_not_archived(metadata: dict) -> bool:
-    """Used for BM25 only (no native metadata filtering there)."""
+    """Used for BM25 only (BM25 has no native metadata filtering, so it
+    still needs a Python-side check). Dense retrieval no longer needs
+    this — ChromaDB filters natively via a where-clause, during the
+    search itself, instead of after."""
     return metadata.get("status", "active") != "archived"
 
 def get_chroma_client():
@@ -25,6 +28,7 @@ def get_chroma_client():
 
 def initialize_vectorstore():
     global vectorstore, ALL_DOCS, dense_retriever, bm25_retriever
+
     try:
         vs = Chroma(
             client=get_chroma_client(),
@@ -74,7 +78,7 @@ def reload_vectorstore():
     print(f"🔄 Vectorstore configuration reloaded globally.")
 
 # ============================================================
-# --- FILE / SYNC HELPERS (unchanged) ---
+# --- FILE / SYNC HELPERS (moved from old app.py) ---
 # ============================================================
 
 def allowed_file(filename):
@@ -89,39 +93,51 @@ def get_file_version(filename):
     return match.group(1) if match else "v1"
 
 def sync_existing_documents():
+    """Scan documents folder and add any files not in DB"""
     from extensions import db
     from models.models import User, ProcessedFile
     from ingest import ingest_documents
     try:
         if not os.path.exists(UPLOAD_FOLDER):
             return
+
         existing_files = os.listdir(UPLOAD_FOLDER)
         admin_user = User.query.filter_by(is_admin=True).first()
         if not admin_user:
             print("⚠️ No admin user found for syncing documents")
             return
+
         synced_count = 0
         for filename in existing_files:
             if not allowed_file(filename):
                 continue
+
             filepath = os.path.join(UPLOAD_FOLDER, filename)
             if not os.path.isfile(filepath):
                 continue
+
             existing = ProcessedFile.query.filter_by(filename=filename).first()
             if existing:
                 continue
+
             try:
                 file_hash = calculate_file_hash(filepath)
                 file_size = os.path.getsize(filepath)
                 version = get_file_version(filename)
+
                 processed = ProcessedFile(
-                    user_id=admin_user.id, filename=filename, file_hash=file_hash,
-                    file_size=file_size, chunk_count=0, version=version
+                    user_id=admin_user.id,
+                    filename=filename,
+                    file_hash=file_hash,
+                    file_size=file_size,
+                    chunk_count=0,
+                    version=version
                 )
                 db.session.add(processed)
                 synced_count += 1
             except Exception as e:
                 print(f"⚠️ Error syncing {filename}: {e}")
+
         if synced_count > 0:
             db.session.commit()
             print(f"✅ Synced {synced_count} pre-existing documents to database")
@@ -129,17 +145,26 @@ def sync_existing_documents():
                 if allowed_file(fname):
                     ingest_documents(fname)
             print("✅ Ingestion complete!")
+
     except Exception as e:
-        print(f"❌ Sync error: {e}")
+        print(f"❌ Sync error: {e}")      
 
 def archive_file_chunks(file_id):
-    """Marks all chunks for file_id as archived, via a real metadata
-    update in ChromaDB — this is the query-time-filterable replacement
-    for the old blacklist-based post-retrieval filtering."""
+    """
+    Marks all chunks belonging to file_id as archived (status='archived')
+    directly in the ChromaDB collection, via a real metadata update —
+    not just an in-memory mutation. This is what makes the archive
+    reliably query-time-filterable: ChromaDB reads the updated status
+    the very next time it's searched.
+
+    Returns the number of chunks archived.
+    """
     global vectorstore, ALL_DOCS
+
     if not vectorstore:
         print("⚠️ archive_file_chunks called but vectorstore is not initialized.")
         return 0
+
     try:
         matches = vectorstore.get(where={"file_id": file_id}, include=["metadatas"])
     except Exception as e:
@@ -148,6 +173,7 @@ def archive_file_chunks(file_id):
 
     matching_ids = matches.get("ids", [])
     matching_metadatas = matches.get("metadatas", [])
+
     if not matching_ids:
         print(f"⚠️ No chunks found with file_id={file_id} — nothing archived.")
         return 0
@@ -165,6 +191,8 @@ def archive_file_chunks(file_id):
         print(f"⚠️ Failed to update ChromaDB metadata for file_id={file_id}: {e}")
         return 0
 
+    # Keep the in-memory ALL_DOCS list consistent too, since BM25 still
+    # relies on a Python-side filter over this list (see is_not_archived).
     archived_count = 0
     for doc in ALL_DOCS:
         if doc.metadata.get("file_id") == file_id:

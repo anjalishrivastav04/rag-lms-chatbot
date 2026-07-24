@@ -46,14 +46,21 @@
          <button onclick="logout()" class="hdr-btn hdr-btn-logout">🚪 Logout</button>
          <select id="translateLang" class="hdr-select">
           <option value="">🌐 No Translation</option>
+          <option value="en">🇬🇧 English</option>
           <option value="hi">🇮🇳 Hindi</option>
           <option value="pa">🇮🇳 Punjabi</option>
-          <option value="es">🇪🇸 Spanish</option>
-          <option value="fr">🇫🇷 French</option>
-          <option value="de">🇩🇪 German</option>
-          <option value="zh">🇨🇳 Chinese</option>
-          <option value="ar">🇸🇦 Arabic</option>
-          <option value="ja">🇯🇵 Japanese</option>
+          <option value="bn">🇮🇳 Bengali</option>
+          <option value="te">🇮🇳 Telugu</option>
+          <option value="mr">🇮🇳 Marathi</option>
+          <option value="ta">🇮🇳 Tamil</option>
+          <option value="gu">🇮🇳 Gujarati</option>
+          <option value="kn">🇮🇳 Kannada</option>
+          <option value="ml">🇮🇳 Malayalam</option>
+          <option value="or">🇮🇳 Odia</option>
+          <option value="as">🇮🇳 Assamese</option>
+          <option value="ur">🇮🇳 Urdu</option>
+          <option value="mai">🇮🇳 Maithili</option>
+          <option value="sa">🇮🇳 Sanskrit</option>
          </select>
         </div>
       </div>
@@ -62,9 +69,9 @@
    
       <div class="chat-input">
         <button id="micBtn" onclick="toggleMic()" title="Speak your question">🎤</button>
-        <label id="uploadBtn" title="Upload PDF, TXT, or Images">
-          📎
-          <input type="file" id="fileInput" accept=".pdf,.txt,.jpg,.jpeg,.png,.bmp,.gif" style="display:none" onchange="uploadFile()" />
+        <label id="uploadBtn" title="Upload PDF">
+         📎
+        <input type="file" id="fileInput" accept=".pdf" style="display:none" onchange="uploadFile()" />
         </label>
         <input type="text" id="userInput" placeholder="Ask something or click 🎤 to speak..." />
         <button id="sendBtn" onclick="sendMessage()">Send</button>
@@ -124,13 +131,13 @@
     // ============================================================
     // ✅ CSRF TOKEN HELPER
     // ============================================================
-    let csrfToken = "";
+    window.csrfToken = "";
 
     async function fetchCsrfToken() {
       try {
         const res = await fetch('/csrf-token');
         const data = await res.json();
-        csrfToken = data.csrf_token;
+        window.csrfToken = data.csrf_token;
       } catch (e) {
         console.error('CSRF token fetch error:', e);
       }
@@ -249,6 +256,7 @@
     // ✅ CHECK IF USER IS LOGGED IN ON PAGE LOAD
     // ============================================================
     window.addEventListener('load', async () => {
+      window.speechSynthesis.onvoiceschanged = () => { window.speechSynthesis.getVoices(); }; // ✅ preload voices
       await fetchCsrfToken(); // ← ADD THIS LINE
       try {
           const response = await fetch('/current-user');
@@ -472,15 +480,25 @@
     }
  
     function speakText(text, lang) {
-      window.speechSynthesis.cancel();
-      const plain = text.replace(/[#*`_~>\-]/g, '').replace(/\n/g, ' ');
-      const utterance = new SpeechSynthesisUtterance(plain);
-      utterance.lang = lang || 'en-US';
-      utterance.rate = 1;
-      utterance.pitch = 1;
-      window.speechSynthesis.speak(utterance);
+    window.speechSynthesis.cancel();
+    const plain = text.replace(/[#*`_~>\-]/g, '').replace(/\n/g, ' ');
+    const utterance = new SpeechSynthesisUtterance(plain);
+    utterance.lang = lang || 'en-US';
+    utterance.rate = 1;
+    utterance.pitch = 1;
+
+    // ✅ Check if voice available for this language
+    const voices = window.speechSynthesis.getVoices();
+    const langCode = lang ? lang.split('-')[0] : 'en';
+    const hasVoice = voices.some(v => v.lang.startsWith(langCode));
+
+    if (!hasVoice && lang && lang !== 'en') {
+        showChatNotification(`⚠️ Text-to-speech not available for ${lang} on your device.`);
+        return;
     }
 
+    window.speechSynthesis.speak(utterance);
+  }
     // ============================================================
     // ✅ UI HELPERS
     // ============================================================
@@ -721,14 +739,17 @@
       const fileInput = document.getElementById("fileInput");
       const file = fileInput.files[0];
       if (!file) return;
+
+      const isPdf = file.name.toLowerCase().endsWith(".pdf") && file.type === "application/pdf";
+      if (!isPdf) {
+        addMessage("❌ Only PDF files are allowed.", "bot");
+        fileInput.value = "";
+        return;
+      }
+
       const formData = new FormData();
       formData.append("file", file);
-      const isImage = ["image/jpeg", "image/png", "image/jpg", "image/bmp", "image/gif"].includes(file.type);
-      if (isImage) {
-        addMessage(`🖼️ Uploading image "${file.name}" (will extract text with OCR)...`, "user");
-      } else {
-        addMessage(`📎 Uploading "${file.name}"...`, "user");
-      }
+       addMessage(`📎 Uploading "${file.name}"...`, "user");
       const box = document.getElementById("messages");
       const thinking = document.createElement("div");
       thinking.className = "message-wrapper bot-wrapper";
@@ -960,11 +981,11 @@
     }
 
     async function deleteFile(filename) {
-        if (!confirm(`Are you sure you want to delete "${filename}"?`)) return;
+    if (!confirm(`Are you sure you want to delete "${filename}"?`)) return;
         try {
-            const response = await fetch(`/documents/${filename}`, {
-            method: 'DELETE',
-            headers: { "X-CSRFToken": csrfToken }
+          const response = await fetch(`/documents/${filename}`, {
+           method: 'DELETE',
+           headers: { "X-CSRFToken": window.csrfToken }
         });
         const data = await response.json();
         if (data.success) {

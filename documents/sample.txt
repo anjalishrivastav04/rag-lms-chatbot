@@ -1,5 +1,0 @@
-Our company TechCorp was founded in 2010.
-We offer three products: TechPro, TechLite and TechMax.
-TechPro costs $99/month, TechLite is free, TechMax costs $199/month.
-Support email is support@techcorp.com.
-Office hours are Monday to Friday 9am to 6pm.

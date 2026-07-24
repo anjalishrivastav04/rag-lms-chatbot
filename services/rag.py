@@ -273,14 +273,17 @@ def is_casual_query(question):
     return False
 
 def is_list_documents_query(question):
-    # (?<!\.) prevents matching "pdf"/"file"/"document" when it's actually
-    # part of a filename extension like "test_diagram_only_v2.pdf" —
-    # previously any question containing "what"/"which" ANYWHERE plus a
-    # .pdf filename anywhere later would wrongly match, since \b matches
-    # right after the dot in ".pdf" too. Now requires the word "pdf" etc.
-    # to NOT be immediately preceded by a period.
-    patterns = r"\b(list|show|what|which)\b.*(?<!\.)\b(document|file|pdf)s?\b"
-    return bool(re.search(patterns, question.lower().strip()))
+    """Detects requests to enumerate available documents (e.g. 'what
+    documents do you have', 'list the files'), NOT questions about
+    content within a specific document (e.g. 'what does the ai document
+    say about...', which must still go through retrieval)."""
+    q = question.lower().strip()
+    patterns = (
+        r"\b(list|show)\s+(me\s+)?(all\s+)?(the\s+)?(uploaded\s+)?(documents?|files?|pdfs?)\b"
+        r"|\b(what|which)\s+(documents?|files?|pdfs?)\s+"
+        r"(do you have|are there|are available|have (i|you)|exist|were uploaded)\b"
+    )
+    return bool(re.search(patterns, q))
 
 def decompose_question(question):
     if is_casual_query(question) or is_list_documents_query(question):
