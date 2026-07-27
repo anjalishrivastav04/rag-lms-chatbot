@@ -425,10 +425,15 @@ def dashboard():
                    user_msg.ip_address
             FROM chat_history user_msg
             JOIN users u ON user_msg.user_id = u.id
-            LEFT JOIN chat_history asst_msg
-                ON asst_msg.session_id = user_msg.session_id
-                AND asst_msg.role = 'assistant'
-                AND asst_msg.created_at > user_msg.created_at
+            LEFT JOIN LATERAL (
+                SELECT content, cache_source, response_time_ms
+                FROM chat_history a
+                WHERE a.session_id = user_msg.session_id
+                  AND a.role = 'assistant'
+                  AND a.created_at > user_msg.created_at
+                ORDER BY a.created_at ASC
+                LIMIT 1
+            ) asst_msg ON true
             LEFT JOIN response_evaluations re
                 ON re.user_id = user_msg.user_id
                 AND re.question = user_msg.content
