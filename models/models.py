@@ -92,34 +92,6 @@ class ProcessedFile(db.Model):
             "chunk_count": self.chunk_count,
             "version": self.version
         }
-    
-class ChunkingDecision(db.Model):
-    __tablename__ = 'chunking_decisions'
-    content_hash = db.Column(db.String(64), primary_key=True)
-    method = db.Column(db.String(50), nullable=False)
-    confidence = db.Column(db.Float)
-    created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now())
-
-    def to_dict(self):
-        return {
-            'content_hash': self.content_hash,
-            'method': self.method,
-            'confidence': self.confidence,
-            'created_at': str(self.created_at)
-        }
-
-class ProcessedFile(db.Model):
-    __tablename__ = 'processed_files'
-    ...
-    def to_dict(self):
-        return {
-            "filename": self.filename,
-            "file_hash": self.file_hash,
-            "file_size": self.file_size,
-            "processed_at": str(self.processed_at),
-            "chunk_count": self.chunk_count,
-            "version": self.version
-        }
 
 class ChunkingDecision(db.Model):          # ← add here, right after ProcessedFile
     __tablename__ = 'chunking_decisions'

@@ -209,3 +209,25 @@ def archive_file_chunks(file_id):
         print(f"⚠️ BM25 rebuild after archiving failed: {e}")
 
     return archived_count
+
+def get_active_file_ids():
+    """Returns the set of file_ids that currently have at least one
+    non-archived chunk in ChromaDB. Used to filter document listings so
+    stale ProcessedFile rows (files removed without going through the
+    proper delete route, or leftover from CLI/manual testing) don't show
+    up as available documents forever."""
+    global vectorstore
+    if not vectorstore:
+        return set()
+    try:
+        raw = vectorstore.get(
+            where={"status": {"$ne": "archived"}},
+            include=["metadatas"]
+        )
+        return {
+            m.get("file_id") for m in raw.get("metadatas", [])
+            if m and m.get("file_id")
+        }
+    except Exception as e:
+        print(f"⚠️ get_active_file_ids failed: {e}")
+        return None  # signal failure so callers can skip filtering rather than list nothing

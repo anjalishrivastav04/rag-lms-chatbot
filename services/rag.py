@@ -482,9 +482,15 @@ Answer:"""
 
     if is_list_documents_query(question):
         try:
+            from services.vectorstore import get_active_file_ids
             blacklist_filenames = set(get_blacklist())
+            active_file_ids = get_active_file_ids()
             files = ProcessedFile.query.all()
-            valid_files = [f for f in files if f.filename not in blacklist_filenames]
+            valid_files = [
+                f for f in files
+                if f.filename not in blacklist_filenames
+                and (active_file_ids is None or f.file_id in active_file_ids)
+            ]
             if not valid_files:
                 return "There are no documents available right now.", "NONE", "📋 Direct database lookup", []
             file_list = "\n".join([f"- {f.file_id}" for f in valid_files])

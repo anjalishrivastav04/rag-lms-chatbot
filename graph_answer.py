@@ -156,6 +156,33 @@ def generate_node(state: ChatState) -> dict:
         len(docs) == 1 and docs[0].metadata.get("source") == "system"
     )
 
+    if state.get("is_list_query"):
+        from models.models import ProcessedFile
+        from services.cache import get_blacklist
+        from services.vectorstore import get_active_file_ids
+        try:
+            blacklist_filenames = set(get_blacklist())
+            active_file_ids = get_active_file_ids()
+            files = ProcessedFile.query.all()
+            valid_files = [
+                f for f in files
+                if f.filename not in blacklist_filenames
+                and (active_file_ids is None or f.file_id in active_file_ids)
+            ]
+            if not valid_files:
+                answer = "There are no documents available right now."
+            else:
+                file_list = "\n".join([f"- {f.file_id}" for f in valid_files])
+                answer = f"Here are the available documents:\n\n{file_list}"
+            logger.info("graph_list_documents_answered", extra={
+                "session_id": state["session_id"],
+                "num_files": len(valid_files),
+            })
+            return {"answer": answer, "cache_source": "NONE"}
+        except Exception:
+            logger.warning("graph_list_documents_failed", exc_info=True)
+            # fall through to normal generation below if the DB lookup itself fails
+
     if state.get("is_casual"):
         prompt = f"""You are RagBot, a friendly document assistant. Respond warmly and briefly.
 
