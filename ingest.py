@@ -14,8 +14,8 @@ from langchain_community.document_loaders import TextLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_groq import ChatGroq
 from langchain_core.documents import Document
+from llm_provider import create_chat_model
 from ocr_handler import save_ocr_text_to_file, extract_text_from_image
 from langchain_classic.indexes import SQLRecordManager, index
 from pdf2image import convert_from_path
@@ -27,10 +27,20 @@ from vision_handler import analyze_image  # 👈 Safe to import now that environ
 POPPLER_PATH = r"C:\Users\iaman\OneDrive\Documents\Desktop\poppler-26.02.0\Library\bin"
 
 # --- REDIS CONFIG ---
-redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+try:
+    redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+    redis_client.ping()
+except Exception:
+    class _UnavailableRedis:
+        def __getattr__(self, name):
+            def _noop(*args, **kwargs):
+                return None
+            return _noop
 
-# --- GROQ LLM ---
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, api_key=os.getenv("GROQ_API_KEY"))
+    redis_client = _UnavailableRedis()
+
+# --- LLM ---
+llm = create_chat_model(temperature=0.0)
 
 # --- EMBEDDINGS ---
 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")

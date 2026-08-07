@@ -159,11 +159,17 @@ def chat():
         # ✅ TIER 2: Kafka queue
         request_id = send_chat_request(user_id, session_id, user_message)
         if not request_id:
-            return jsonify({"reply": "❌ Failed to queue your request. Please try again.", "done": True})
+            clear_user_request_pending(user_id)
+            answer = get_answer(user_message, user_id, session_id)
+            return jsonify({
+                "reply": answer,
+                "done": True,
+                "cache_source": "DIRECT_FALLBACK"
+            })
 
         set_user_request_pending(user_id, request_id)
         return jsonify({
-            "reply": "⏳ Processing your request...",
+            "reply": "⏳ Your request has been queued. A background worker will process it shortly.",
             "request_id": request_id,
             "done": False
         })

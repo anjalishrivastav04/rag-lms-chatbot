@@ -1,7 +1,16 @@
 import os
 from flask import Flask, render_template, redirect, session
 from dotenv import load_dotenv
-from apscheduler.schedulers.background import BackgroundScheduler
+
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+except ModuleNotFoundError:
+    class BackgroundScheduler:
+        def add_job(self, *args, **kwargs):
+            return None
+
+        def start(self):
+            return None
 
 load_dotenv()
 os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY", "")
@@ -22,9 +31,12 @@ app.wsgi_app = RequestIdMiddleware(app.wsgi_app)
 # --- CONFIG ---
 # ============================================================
 app.config['WTF_CSRF_TIME_LIMIT'] = None
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv(
-    'DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/postgres'
-)
+default_db_url = 'postgresql://postgres:MyStrongPassword123!@localhost:5432/postgres'
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', default_db_url)
+if os.getenv('DATABASE_URL'):
+    print(f"Using database URL from environment: {os.getenv('DATABASE_URL')}")
+else:
+    print(f"Using default database URL: {default_db_url}")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'pool_size': 20,

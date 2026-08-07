@@ -2,8 +2,8 @@ import os
 import re
 import json
 from neo4j import GraphDatabase
-from langchain_groq import ChatGroq
 from dotenv import load_dotenv
+from llm_provider import create_chat_model
 
 load_dotenv()
 
@@ -14,16 +14,13 @@ NEO4J_PASSWORD = "password"
 def get_driver():
     return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
 
-# --- GROQ LLM ---
+# --- LLM ---
 # Using the larger 70B model specifically for graph extraction (not the
 # 8B model used elsewhere) because the comprehensive cybersecurity
 # ontology below has 27 entity types and 27 relation types — a small,
 # fast model tends to misclassify or default to generic labels when
 # given that many options to choose from in one prompt.
-llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
-    temperature=0,
-    api_key=os.getenv("GROQ_API_KEY"))
+llm = create_chat_model(temperature=0.0)
 
 
 # -------------------------------------------

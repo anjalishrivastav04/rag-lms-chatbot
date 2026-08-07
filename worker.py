@@ -220,7 +220,7 @@ def process_message(payload):
                 "user_id": user_id,
             })
             result = {
-                "reply": f"Sorry, something went wrong: {str(e)}",
+                "reply": f"Sorry, something went wrong: {repr(e)}",
                 "retrieval_info": "",
                 "cache_source": "NONE",
                 "duration_ms": int((time.time() - start_time) * 1000),
@@ -251,9 +251,15 @@ def main():
     consumer = get_consumer(group_id="rag-worker-group")
 
     try:
-        for message in consumer:
-            payload = message.value
-            process_message(payload)
+        logger.info("worker_consumer_loop_started")
+        while True:
+            try:
+                for message in consumer:
+                    payload = message.value
+                    process_message(payload)
+            except Exception as exc:
+                logger.warning("worker_consumer_iteration_failed", exc_info=True, extra={"error": str(exc)})
+                time.sleep(5)
     except KeyboardInterrupt:
         logger.info("worker_stopped_by_user")
     finally:

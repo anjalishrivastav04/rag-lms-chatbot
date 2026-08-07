@@ -6,8 +6,14 @@ Handles Kafka producer (sending chat requests to queue) and consumer
 
 import json
 import uuid
-from kafka import KafkaProducer, KafkaConsumer
-from kafka.errors import KafkaError
+
+try:
+    from kafka import KafkaProducer, KafkaConsumer
+    from kafka.errors import KafkaError
+except Exception:
+    KafkaProducer = None
+    KafkaConsumer = None
+    KafkaError = Exception
 
 KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
 CHAT_REQUESTS_TOPIC = "chat-requests"
@@ -25,6 +31,9 @@ def get_producer():
     """Lazily create and reuse a single Kafka producer instance with auto-reconnect."""
     global _producer
     if _producer is None:
+        if KafkaProducer is None:
+            print("⚠️ Kafka library unavailable")
+            return None
         try:
             _producer = KafkaProducer(
                 bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
@@ -78,6 +87,8 @@ def send_chat_request(user_id, session_id, user_message):
 
 def get_consumer(group_id="rag-worker-group"):
     """Create a Kafka consumer that reads chat requests one at a time."""
+    if KafkaConsumer is None:
+        return None
     consumer = KafkaConsumer(
         CHAT_REQUESTS_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,

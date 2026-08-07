@@ -1,6 +1,16 @@
 import redis
 
-redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+try:
+    redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+    redis_client.ping()
+except Exception:
+    class _UnavailableRedis:
+        def __getattr__(self, name):
+            def _noop(*args, **kwargs):
+                return None
+            return _noop
+
+    redis_client = _UnavailableRedis()
 
 def save_source_index(filename, chunk_ids):
     """Store filename → chunk_ids mapping in Redis for O(1) deletion"""
