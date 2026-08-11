@@ -33,6 +33,17 @@ import contextvars
 import os
 from datetime import datetime, timezone
 
+# ANSI colour codes (gracefully ignored on Windows / non-tty)
+_RESET  = "\033[0m"
+_BOLD   = "\033[1m"
+_DIM    = "\033[2m"
+_RED    = "\033[31m"
+_GREEN  = "\033[32m"
+_YELLOW = "\033[33m"
+_CYAN   = "\033[36m"
+_WHITE  = "\033[37m"
+_GREY   = "\033[90m"
+
 # ---------------------------------------------------------------------------
 # 1. Context variable that holds the current trace_id.
 #    contextvars (not thread-local / not flask.g) because it works correctly
@@ -95,6 +106,97 @@ class JsonFormatter(logging.Formatter):
 
 
 # ---------------------------------------------------------------------------
+# 2b. Pretty console formatter — human-readable, emoji-tagged lines.
+#     JSON stays in the file; this goes to stdout only.
+# ---------------------------------------------------------------------------
+_LEVEL_ICONS = {
+    "DEBUG":    f"{_GREY}🔍 DEBUG{_RESET}",
+    "INFO":     f"{_GREEN}✅ INFO {_RESET}",
+    "WARNING":  f"{_YELLOW}⚠️  WARN {_RESET}",
+    "ERROR":    f"{_RED}❌ ERROR{_RESET}",
+    "CRITICAL": f"{_RED}{_BOLD}🔥 CRIT {_RESET}",
+}
+
+_MSG_ICONS = {
+    # worker lifecycle
+    "worker_starting":                  "🚀",
+    "worker_consumer_loop_started":      "👂",
+    "worker_stopped_by_user":           "🛑",
+    "worker_shutdown_complete":         "🔒",
+    "vectorstore_initialized":          "📚",
+    "vectorstore_reload_thread_started":"🔄",
+    "vectorstore_reloaded_via_signal":  "🔄",
+    "langgraph_initialized":            "🕸️ ",
+    # message processing
+    "message_processing_started":       "📨",
+    "message_processing_completed":     "✔️ ",
+    "message_processing_failed":        "💥",
+    "worker_message_timeout":           "⏰",
+    "worker_message_processing_error":  "💥",
+    "result_saved":                     "💾",
+    # answer / cache
+    "langgraph_answer_complete":        "🤖",
+    "question_decomposed":              "🔀",
+    "low_confidence_answer":            "🎯",
+    "worker_consumer_iteration_failed": "🔁",
+    # retrieval
+    "retrieval_completed":              "🔍",
+    "chunks_selected":                  "📋",
+    "retrieved_chunk":                  "📄",
+    "graph_chunk_injected":             "🕸️ ",
+    "rerank_completed":                 "🏆",
+    "rag_fusion_completed":             "🌊",
+    "cache_hit":                        "⚡",
+    "blacklist_filter_applied":         "🚫",
+    "graph_entities_added":             "🕸️ ",
+}
+
+
+class PrettyConsoleFormatter(logging.Formatter):
+    """Colourised, emoji-tagged single-line formatter for terminal output."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        now = datetime.now().strftime("%H:%M:%S")
+        level_tag = _LEVEL_ICONS.get(record.levelname, record.levelname)
+        msg = record.getMessage()
+        icon = _MSG_ICONS.get(msg, "•")
+
+        # Build the extra fields string (skip internal Python attrs)
+        reserved = {
+            "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
+            "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
+            "created", "msecs", "relativeCreated", "thread", "threadName",
+            "processName", "process", "message", "trace_id", "taskName",
+        }
+        extras = {
+            k: v for k, v in record.__dict__.items()
+            if k not in reserved and not k.startswith("_")
+        }
+        extras_str = "  " + "  ".join(
+            f"{_CYAN}{k}{_RESET}={_BOLD}{v}{_RESET}" for k, v in extras.items()
+        ) if extras else ""
+
+        trace = getattr(record, "trace_id", "-")
+        trace_short = trace[:8] if trace and trace != "-" else "--------"
+
+        line = (
+            f"{_DIM}[{now}]{_RESET} "
+            f"{level_tag} "
+            f"{_GREY}│{_RESET} "
+            f"{_DIM}{record.name:<8}{_RESET} "
+            f"{_GREY}│{_RESET} "
+            f"{icon} {_BOLD}{msg}{_RESET}"
+            f"{extras_str}"
+            f"  {_GREY}trace={trace_short}{_RESET}"
+        )
+
+        if record.exc_info:
+            line += "\n" + self.formatException(record.exc_info)
+
+        return line
+
+
+# ---------------------------------------------------------------------------
 # 3. setup_logging() — call once per process (once in app.py, once in worker.py)
 # ---------------------------------------------------------------------------
 def setup_logging(
@@ -106,8 +208,12 @@ def setup_logging(
 ) -> logging.Logger:
     os.makedirs(log_dir, exist_ok=True)
 
+    # ✅ Read LOG_LEVEL env var: set LOG_LEVEL=DEBUG in .env to see per-chunk logs
+    env_level_str = os.getenv("LOG_LEVEL", "").upper()
+    console_level = getattr(logging, env_level_str, level)
+
     logger = logging.getLogger(service_name)
-    logger.setLevel(level)
+    logger.setLevel(min(level, console_level))  # logger must be at least as low as handlers
     logger.handlers.clear()  # avoid duplicate handlers on reload (Flask debug mode)
 
     formatter = JsonFormatter()
@@ -123,9 +229,10 @@ def setup_logging(
     file_handler.addFilter(trace_filter)
     logger.addHandler(file_handler)
 
-    # Console handler too (useful when watching `docker logs` or terminal)
+    # Console handler — pretty human-readable format for the terminal
     console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
+    console_handler.setLevel(console_level)  # ✅ Respects LOG_LEVEL env var
+    console_handler.setFormatter(PrettyConsoleFormatter())
     console_handler.addFilter(trace_filter)
     logger.addHandler(console_handler)
 

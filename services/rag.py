@@ -514,6 +514,23 @@ Answer:"""
         "latency_ms": retrieval_latency_ms,
         "num_docs": len(docs),
     })
+    # ——— Log each chunk at DEBUG (only shown if log level set to DEBUG) ———
+    for i, doc in enumerate(docs):
+        src = doc.metadata.get("source", "unknown")
+        chunk_idx = doc.metadata.get("chunk_index", "?")
+        preview = doc.page_content[:120].replace("\n", " ")
+        logger.debug("retrieved_chunk", extra={
+            "rank": i + 1,
+            "source": src,
+            "chunk": chunk_idx,
+            "preview": preview,
+        })
+    # ——— Always-visible one-liner summary of selected chunks ———
+    chunk_summary = [
+        f"{doc.metadata.get('source','?')}[{doc.metadata.get('chunk_index','?')}]"
+        for doc in docs
+    ]
+    logger.info("chunks_selected", extra={"chunks": chunk_summary})
 
     if blacklist:
         original_count = len(docs)
@@ -554,6 +571,17 @@ Answer:"""
             "num_entities": len(related_entities[:5]),
             "total_docs": len(docs),
         })
+        # Log any graph-injected chunks at DEBUG
+        for entity_doc in extra_docs:
+            if entity_doc.page_content in {d.page_content for d in docs}:
+                src = entity_doc.metadata.get("source", "unknown")
+                chunk_idx = entity_doc.metadata.get("chunk_index", "?")
+                preview = entity_doc.page_content[:120].replace("\n", " ")
+                logger.debug("graph_chunk_injected", extra={
+                    "source": src,
+                    "chunk": chunk_idx,
+                    "preview": preview,
+                })
 
     if not docs or (len(docs) == 1 and docs[0].metadata.get("source") == "system"):
     # ✅ Fallback to LLM general knowledge

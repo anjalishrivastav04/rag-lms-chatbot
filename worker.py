@@ -2,23 +2,24 @@ import json
 import time
 import os
 import threading
+
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dotenv import load_dotenv
 from kafka_handler import get_consumer
-
-load_dotenv()
-from logging_config import setup_logging, set_trace_id
-
-logger = setup_logging("worker")
 from app import app
 from extensions import redis_client
 from services.rag import get_answer, save_chat_message, decompose_question, generate_followup_options, is_casual_query, is_list_documents_query
 from services.evaluation import evaluate_response
 from services.cache import get_pending_parts, save_pending_parts, clear_pending_parts
+from logging_config import setup_logging, set_trace_id 
+from services.vectorstore import initialize_vectorstore
 
-# ✅ NEW: toggle between old if/else logic and the LangGraph version.
-# Set USE_LANGGRAPH=true in your .env once you trust the graph in production.
-# Defaults to "false" so nothing changes for you until you flip it on purpose.
+load_dotenv()
+REDIS_RESULT_TTL = 300
 USE_LANGGRAPH = os.getenv("USE_LANGGRAPH", "false").lower() == "true"
+WORKER_TIMEOUT_SECONDS = 90  # ✅ Kill a hung LLM call after 90s
+
+logger = setup_logging("worker")
 
 if USE_LANGGRAPH:
     from graph_answer import build_graph
@@ -32,7 +33,7 @@ if USE_LANGGRAPH:
         return _graph
 
 
-REDIS_RESULT_TTL = 300
+_executor = ThreadPoolExecutor(max_workers=1)
 
 def listen_for_vectorstore_updates():
     pubsub = redis_client.pubsub()
@@ -41,16 +42,10 @@ def listen_for_vectorstore_updates():
     for message in pubsub.listen():
         if message["type"] == "message":
             with app.app_context():
-                from services.vectorstore import initialize_vectorstore
                 initialize_vectorstore()
                 logger.info("vectorstore_reloaded_via_signal")
 
 def answer_question(question, session_id, user_id):
-    """
-    Single entry point for getting an answer — routes to either the old
-    get_answer() or the new LangGraph version, based on USE_LANGGRAPH.
-    Returns the same 4-tuple shape either way, so callers don't need to care.
-    """
     if USE_LANGGRAPH:
         graph = get_graph()
         result = graph.invoke({
@@ -73,8 +68,6 @@ def answer_question(question, session_id, user_id):
         return answer, cache_source, retrieval_info, options, needs_escalation
     else:
         answer, cache_source, retrieval_info, options = get_answer(question, session_id)
-        # Old path recomputes low_confidence itself further down (unchanged) —
-        # return None here so process_message knows to use its existing logic.
         return answer, cache_source, retrieval_info, options, None
 
 
@@ -87,11 +80,10 @@ def process_message(payload):
     set_trace_id(request_id)
 
     logger.info("message_processing_started", extra={
-        "request_id": request_id,
-        "user_id": user_id,
-        "session_id": session_id,
-        "message_preview": user_message[:50],
-        "using_langgraph": USE_LANGGRAPH,
+        "req": request_id[:8],
+        "user": user_id,
+        "session": session_id[:8],
+        "q": user_message[:60],
     })
     start_time = time.time()
 
@@ -209,15 +201,17 @@ def process_message(payload):
                     }
 
             logger.info("message_processing_completed", extra={
-                "request_id": request_id,
+                "req": request_id[:8],
                 "duration_ms": result["duration_ms"],
-                "cache_source": result["cache_source"],
+                "cache": result["cache_source"],
+                "reply_len": len(result.get("reply", "")),
             })
 
         except Exception as e:
             logger.error("message_processing_failed", exc_info=True, extra={
-                "request_id": request_id,
-                "user_id": user_id,
+                "req": request_id[:8],
+                "user": user_id,
+                "error": repr(e)[:120],
             })
             result = {
                 "reply": f"Sorry, something went wrong: {repr(e)}",
@@ -231,13 +225,19 @@ def process_message(payload):
     result_key = f"chat_result:{request_id}"
     redis_client.setex(result_key, REDIS_RESULT_TTL, json.dumps(result))
     logger.info("result_saved", extra={
-        "request_id": request_id,
-        "duration_ms": result["duration_ms"],
+        "req": request_id[:8],
+        "ttl_s": REDIS_RESULT_TTL,
     })
 
 
 def main():
-    logger.info("worker_starting", extra={"topic": "chat-requests", "using_langgraph": USE_LANGGRAPH})
+    from llm_provider import get_llm_provider
+    logger.info("worker_starting", extra={
+        "topic": "chat-requests",
+        "llm_provider": get_llm_provider(),
+        "using_langgraph": USE_LANGGRAPH,
+        "timeout_s": WORKER_TIMEOUT_SECONDS,
+    })
 
     with app.app_context():
         from services.vectorstore import initialize_vectorstore
@@ -254,9 +254,36 @@ def main():
         logger.info("worker_consumer_loop_started")
         while True:
             try:
-                for message in consumer:
-                    payload = message.value
-                    process_message(payload)
+                # ✅ poll() returns after timeout_ms even with no messages,
+                #    so Kafka's background heartbeat sender is never starved.
+                #    The old `for message in consumer:` was a blocking iterator
+                #    that prevented heartbeats during long LLM processing.
+                records = consumer.poll(timeout_ms=5000)
+                for tp, messages in records.items():
+                    for message in messages:
+                        payload = message.value
+                        request_id = payload.get("request_id", "unknown")
+                        future = _executor.submit(process_message, payload)
+                        try:
+                            future.result(timeout=WORKER_TIMEOUT_SECONDS)
+                        except FuturesTimeoutError:
+                            logger.error("worker_message_timeout", extra={
+                                "request_id": request_id,
+                                "timeout_seconds": WORKER_TIMEOUT_SECONDS,
+                            })
+                            # ✅ Write a timeout error to Redis so the frontend stops polling
+                            result_key = f"chat_result:{request_id}"
+                            redis_client.setex(result_key, REDIS_RESULT_TTL, json.dumps({
+                                "reply": "⏰ Sorry, the AI took too long to respond. Please try again.",
+                                "retrieval_info": "",
+                                "cache_source": "TIMEOUT",
+                                "duration_ms": WORKER_TIMEOUT_SECONDS * 1000,
+                                "parts": [],
+                                "options": [],
+                                "request_id": request_id,
+                            }))
+                        except Exception as exc:
+                            logger.error("worker_message_processing_error", exc_info=True, extra={"request_id": request_id})
             except Exception as exc:
                 logger.warning("worker_consumer_iteration_failed", exc_info=True, extra={"error": str(exc)})
                 time.sleep(5)

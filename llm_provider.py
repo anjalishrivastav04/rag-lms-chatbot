@@ -50,4 +50,6 @@ def create_chat_model(temperature: float = 0.0, model: str | None = None):
         model=selected_model,
         temperature=temperature,
         api_key=os.getenv("GROQ_API_KEY", ""),
+        timeout=30,       # ✅ Don't hang forever — fail fast after 30s
+        max_retries=2,    # ✅ Retry twice before giving up
     )

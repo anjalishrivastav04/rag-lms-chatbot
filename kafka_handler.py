@@ -41,7 +41,11 @@ def get_producer():
                 acks="all",
                 retries=3,
                 request_timeout_ms=5000,
-                max_block_ms=5000
+                max_block_ms=5000,
+                # ✅ Back off before retrying failed sends — reduces broker pressure
+                retry_backoff_ms=500,
+                reconnect_backoff_ms=500,
+                reconnect_backoff_max_ms=10_000,
             )
             print("✅ Kafka Producer connected!")
         except Exception as e:
@@ -96,6 +100,24 @@ def get_consumer(group_id="rag-worker-group"):
         value_deserializer=lambda v: json.loads(v.decode("utf-8")),
         auto_offset_reset="earliest",
         enable_auto_commit=True,
-        max_poll_records=1  # ✅ Process ONE message at a time (per requirement)
+        max_poll_records=1,          # ✅ Process ONE message at a time
+        # ✅ Give the worker 10 min to finish a message before Kafka
+        #    considers it dead and revokes its group membership.
+        #    Default is 300s which can be hit by slow LLM calls.
+        max_poll_interval_ms=600_000,
+        # ✅ Send a heartbeat to the broker every 3s so the session
+        #    stays alive even when processing takes a long time.
+        heartbeat_interval_ms=3_000,
+        # ✅ Broker declares the consumer dead after 30s with no heartbeat.
+        #    Must be > heartbeat_interval_ms and < max_poll_interval_ms.
+        session_timeout_ms=30_000,
+        # ✅ poll() returns after 5s even if no messages arrived, so the
+        #    worker loop can service other tasks (signals, health checks).
+        consumer_timeout_ms=5_000,
+        # ✅ Back off 500ms before retrying NotCoordinatorError / metadata
+        #    refresh failures — prevents retry storms that cause 20s+ blocking
+        retry_backoff_ms=500,
+        reconnect_backoff_ms=500,
+        reconnect_backoff_max_ms=10_000,
     )
     return consumer
