@@ -210,6 +210,20 @@
     //    It always re-enables the input via unlockInput(), whether
     //    the result arrives, errors out, or times out.
     // ============================================================
+    // Normalize reply: Groq/Gemini may return a list of content-block objects.
+    // Always produce a plain string before sending to translateText/addMessage.
+    function normalizeReply(reply) {
+      if (typeof reply === "string") return reply;
+      if (Array.isArray(reply)) {
+        return reply.map(block => {
+          if (typeof block === "string") return block;
+          if (block && typeof block === "object") return block.text || "";
+          return "";
+        }).join("");
+      }
+      return String(reply ?? "");
+    }
+
     async function pollForResult(requestId, targetLang, attempt = 0) {
       const MAX_ATTEMPTS = 60;       // ~60 second max wait (60 * 1000ms)
       const POLL_INTERVAL = 1000;    // Check every 1 second
@@ -225,7 +239,7 @@
         const res = await fetch(`/chat/result/${requestId}`);
         const data = await res.json();
         if (data.done) {
-          const reply = data.reply;
+          const reply = normalizeReply(data.reply);
           const retrieval_info = data.retrieval_info || "";
           const cache_source = data.cache_source || "";
           const parts = data.parts || null;
@@ -251,6 +265,7 @@
         unlockInput(); // ✅ critical — never leave the UI stuck on a fetch error
       }
     }
+
 
     // ============================================================
     // ✅ CHECK IF USER IS LOGGED IN ON PAGE LOAD

@@ -23,11 +23,36 @@ logger = logging.getLogger("worker")
 # --- SAFE LLM INVOKE ---
 # ============================================================
 
+def _extract_text(content) -> str:
+    """
+    Normalise an LLM response content value to a plain string.
+
+    Some Groq / Gemini model versions return a list of content-block dicts
+    like [{"type": "text", "text": "...", "extras": {...}}] instead of a
+    bare string.  This helper extracts the text regardless of format so the
+    rest of the pipeline always operates on a str.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    return str(content)
+
+
 def safe_invoke(llm_instance, prompt, max_retries=2, wait_seconds=20):
     last_error = None
     for attempt in range(max_retries + 1):
         try:
-            return llm_instance.invoke(prompt)
+            response = llm_instance.invoke(prompt)
+            # Normalise content to plain str regardless of provider format
+            response.content = _extract_text(response.content)
+            return response
         except Exception as e:
             last_error = e
             error_str = str(e)
